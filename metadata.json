@@ -1,0 +1,8 @@
+{
+  "name": "AirTax Praha - Evidence ubytovaných a poplatky z pobytu",
+  "description": "Chytrá aplikace pro evidenci hostů a výpočet poplatků z pobytu v hl. m. Praze s dynamickým Gemini OCR skenerem ubytovacích lístků.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
