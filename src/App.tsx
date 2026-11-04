@@ -43,6 +43,7 @@ import {
   saveApiKeyToSheet,
   SpreadsheetInfo
 } from './lib/googleSheets';
+import { runClientGeminiOcr } from './lib/geminiClientOcr';
 
 // Safe localStorage wrapper for Google Sites iframe sandboxes
 const safeStorage = {
@@ -177,30 +178,54 @@ export default function App() {
     }, 3500);
   };
 
-  // 1. Fetch initial data from server on mount
+  // Local persistence helper (works on static hosts like GitHub Pages and inside iframes)
+  const persistLocalState = (props: Property[], gst: Guest[], activeId?: string) => {
+    try {
+      safeStorage.setItem('airtax_local_yaml', jsyaml.dump({
+        meta: {
+          version: '3.0',
+          lastUpdated: new Date().toISOString(),
+          activePropertyId: activeId || activePropertyId || props[0]?.id || ''
+        },
+        properties: props,
+        guests: gst
+      }));
+    } catch (e) {
+      console.warn('Failed to persist to local storage', e);
+    }
+  };
+
+  // 1. Fetch initial data from server on mount with static fallback (GitHub Pages)
   const fetchCloudData = async () => {
     try {
       setIsLoading(true);
-      const res = await fetch('/api/data');
-      if (res.ok) {
-        const data = await res.json();
-        setProperties(data.properties || []);
-        setGuests(data.guests || []);
-        setActivePropertyId(data.activePropertyId || (data.properties?.[0]?.id ?? ''));
+      let loadedFromServer = false;
+      try {
+        const res = await fetch('/api/data');
+        if (res.ok) {
+          const data = await res.json();
+          setProperties(data.properties || []);
+          setGuests(data.guests || []);
+          setActivePropertyId(data.activePropertyId || (data.properties?.[0]?.id ?? ''));
+          loadedFromServer = true;
+        }
+      } catch {
+        // Expected when hosted statically without Node backend (e.g. GitHub Pages)
       }
-    } catch (err) {
-      console.warn('Could not load data from cloud server, falling back to local storage', err);
-      // Fallback to local storage if available
-      const localYaml = safeStorage.getItem('airtax_local_yaml');
-      if (localYaml) {
-        try {
-          const parsed = jsyaml.load(localYaml) as any;
-          if (parsed) {
-            setProperties(parsed.properties || []);
-            setGuests(parsed.guests || []);
-            setActivePropertyId(parsed.meta?.activePropertyId || '');
-          }
-        } catch {}
+
+      if (!loadedFromServer) {
+        // Fallback to local storage
+        const localYaml = safeStorage.getItem('airtax_local_yaml');
+        if (localYaml) {
+          try {
+            const parsed = jsyaml.load(localYaml) as any;
+            if (parsed) {
+              setProperties(parsed.properties || []);
+              setGuests(parsed.guests || []);
+              setActivePropertyId(parsed.meta?.activePropertyId || (parsed.properties?.[0]?.id ?? ''));
+            }
+          } catch {}
+        }
       }
     } finally {
       setIsLoading(false);
@@ -415,27 +440,44 @@ export default function App() {
     }
 
     try {
-      const res = await fetch('/api/properties', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: editingPropId,
-          ...propForm
-        })
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        setProperties(data.properties);
-        setActivePropertyId(data.activePropertyId);
-        setIsPropModalOpen(false);
-        syncToSheetIfConnected(data.properties, guests);
-        showToast('Ubytovací místo uloženo na cloud!', 'success');
+      const propId = editingPropId || `prop_${Date.now()}`;
+      let newProps = [...properties];
+      const existingIdx = newProps.findIndex(p => p.id === propId);
+      const updatedProp: Property = {
+        id: propId,
+        ...propForm
+      };
+      if (existingIdx >= 0) {
+        newProps[existingIdx] = updatedProp;
       } else {
-        showToast('Chyba při ukládání ubytování.', 'warning');
+        newProps.push(updatedProp);
       }
+
+      try {
+        const res = await fetch('/api/properties', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: editingPropId,
+            ...propForm
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          newProps = data.properties;
+        }
+      } catch {
+        // Static hosting fallback (GitHub Pages)
+      }
+
+      setProperties(newProps);
+      setActivePropertyId(propId);
+      setIsPropModalOpen(false);
+      persistLocalState(newProps, guests, propId);
+      syncToSheetIfConnected(newProps, guests);
+      showToast('Ubytovací místo uloženo!', 'success');
     } catch (err: any) {
-      showToast('Chyba spojení se serverem: ' + err.message, 'warning');
+      showToast('Chyba při ukládání ubytování: ' + err.message, 'warning');
     }
   };
 
@@ -443,15 +485,28 @@ export default function App() {
     if (!window.confirm('Opravdu chcete smazat toto ubytování a všechny jeho hosty?')) return;
 
     try {
-      const res = await fetch(`/api/properties/${propId}`, { method: 'DELETE' });
-      if (res.ok) {
-        const data = await res.json();
-        setProperties(data.properties);
-        setGuests(data.guests);
-        setActivePropertyId(data.activePropertyId);
-        syncToSheetIfConnected(data.properties, data.guests);
-        showToast('Ubytování bylo smazáno.', 'info');
+      let newProps = properties.filter(p => p.id !== propId);
+      let newGuests = guests.filter(g => g.propertyId !== propId);
+      let newActiveId = activePropertyId === propId ? (newProps[0]?.id || '') : activePropertyId;
+
+      try {
+        const res = await fetch(`/api/properties/${propId}`, { method: 'DELETE' });
+        if (res.ok) {
+          const data = await res.json();
+          newProps = data.properties;
+          newGuests = data.guests;
+          newActiveId = data.activePropertyId;
+        }
+      } catch {
+        // Static hosting fallback (GitHub Pages)
       }
+
+      setProperties(newProps);
+      setGuests(newGuests);
+      setActivePropertyId(newActiveId);
+      persistLocalState(newProps, newGuests, newActiveId);
+      syncToSheetIfConnected(newProps, newGuests);
+      showToast('Ubytování bylo smazáno.', 'info');
     } catch (err: any) {
       showToast('Chyba při mazání: ' + err.message, 'warning');
     }
@@ -512,23 +567,50 @@ export default function App() {
     }
 
     try {
-      const res = await fetch('/api/guests', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: editingGuest?.id,
-          propertyId: activeProperty.id,
-          ...guestForm
-        })
-      });
+      const gId = editingGuest?.id || `g_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      const nights = Math.max(1, guestForm.nights || 1);
+      const isExempt = guestForm.exemption !== 'none';
+      const fee = isExempt ? 0 : nights * 50;
+      const guestObj: Guest = {
+        id: gId,
+        propertyId: activeProperty.id,
+        ...guestForm,
+        fullName: `${guestForm.firstName} ${guestForm.lastName}`.trim(),
+        fee,
+        createdAt: editingGuest?.createdAt || new Date().toISOString()
+      };
 
-      if (res.ok) {
-        const data = await res.json();
-        setGuests(data.guests);
-        setIsGuestModalOpen(false);
-        syncToSheetIfConnected(properties, data.guests);
-        showToast('Host byl úspěšně uložen do knihy!', 'success');
+      let newGuests = [...guests];
+      const existingIdx = newGuests.findIndex(g => g.id === gId);
+      if (existingIdx >= 0) {
+        newGuests[existingIdx] = guestObj;
+      } else {
+        newGuests.unshift(guestObj);
       }
+
+      try {
+        const res = await fetch('/api/guests', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: editingGuest?.id,
+            propertyId: activeProperty.id,
+            ...guestForm
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          newGuests = data.guests;
+        }
+      } catch {
+        // Static hosting fallback (GitHub Pages)
+      }
+
+      setGuests(newGuests);
+      setIsGuestModalOpen(false);
+      persistLocalState(properties, newGuests);
+      syncToSheetIfConnected(properties, newGuests);
+      showToast('Host byl úspěšně uložen do knihy!', 'success');
     } catch (err: any) {
       showToast('Chyba při ukládání hosta: ' + err.message, 'warning');
     }
@@ -537,13 +619,20 @@ export default function App() {
   const handleDeleteGuest = async (id: string) => {
     if (!window.confirm('Opravdu smazat tohoto hosta z knihy?')) return;
     try {
-      const res = await fetch(`/api/guests/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        const data = await res.json();
-        setGuests(data.guests);
-        syncToSheetIfConnected(properties, data.guests);
-        showToast('Záznam hosta smazán.', 'info');
+      let newGuests = guests.filter(g => g.id !== id);
+      try {
+        const res = await fetch(`/api/guests/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          const data = await res.json();
+          newGuests = data.guests;
+        }
+      } catch {
+        // Static hosting fallback (GitHub Pages)
       }
+      setGuests(newGuests);
+      persistLocalState(properties, newGuests);
+      syncToSheetIfConnected(properties, newGuests);
+      showToast('Záznam hosta smazán.', 'info');
     } catch (err: any) {
       showToast('Chyba při mazání hosta: ' + err.message, 'warning');
     }
@@ -674,30 +763,118 @@ export default function App() {
     }
   };
 
-  // OCR Processing Core
+  // Batch guest saving helper (works with and without backend)
+  const saveBatchGuests = async (targetProp: Property, newGuestList: any[]) => {
+    let updatedProps = [...properties];
+    const existingIdx = updatedProps.findIndex(p => p.id === targetProp.id || (p.name.toLowerCase() === targetProp.name.toLowerCase() && p.districtKey === targetProp.districtKey));
+    if (existingIdx >= 0) {
+      updatedProps[existingIdx] = targetProp;
+    } else {
+      updatedProps.push(targetProp);
+    }
+
+    const formattedGuests: Guest[] = newGuestList.map((g: any) => {
+      const nights = Math.max(1, parseInt(g.nights) || 1);
+      const isExempt = g.exemption && g.exemption !== 'none';
+      return {
+        id: g.id || `g_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        propertyId: targetProp.id,
+        unit: (g.unit || '').trim(),
+        airbnbCode: (g.airbnbCode || '').trim().toUpperCase(),
+        firstName: (g.firstName || '').trim(),
+        lastName: (g.lastName || '').trim(),
+        fullName: (g.fullName || `${g.firstName || ''} ${g.lastName || ''}`).trim() || 'Host',
+        birthDate: g.birthDate || '',
+        nationality: (g.nationality || 'CZ').trim().toUpperCase(),
+        purposeOfStay: g.purposeOfStay || '10 turistika / leisure',
+        idDocumentNumber: (g.idDocumentNumber || '').trim(),
+        idDocumentType: (g.idDocumentType || 'PAS'),
+        visaNumber: (g.visaNumber || '').trim(),
+        address: (g.address || '').trim(),
+        dateArrival: g.dateArrival || '',
+        dateDeparture: g.dateDeparture || '',
+        nights,
+        exemption: g.exemption || 'none',
+        fee: isExempt ? 0 : nights * 50,
+        createdAt: new Date().toISOString()
+      };
+    });
+
+    let updatedGuests = [...formattedGuests, ...guests];
+
+    try {
+      const batchRes = await fetch('/api/batch-guests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          property: targetProp,
+          guests: formattedGuests
+        })
+      });
+      if (batchRes.ok) {
+        const batchData = await batchRes.json();
+        updatedProps = batchData.properties;
+        updatedGuests = batchData.guests;
+      }
+    } catch {
+      // Backend not available (static host such as GitHub Pages)
+    }
+
+    setProperties(updatedProps);
+    setGuests(updatedGuests);
+    setActivePropertyId(targetProp.id);
+    persistLocalState(updatedProps, updatedGuests, targetProp.id);
+    syncToSheetIfConnected(updatedProps, updatedGuests);
+    return { updatedProps, updatedGuests };
+  };
+
+  // OCR Processing Core (Supports both Cloud Server and Client-side Gemini on GitHub Pages)
   const processImageForOCR = async (dataUrl: string) => {
     setImagePreview(dataUrl);
     setIsScanning(true);
     setScanStatus(`Čtu formulář pomocí ${activeModelName}...`);
 
     try {
-      const res = await fetch('/api/ocr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageBase64: dataUrl,
-          mimeType: 'image/jpeg',
-          userApiKey: userApiKey || undefined,
-          preferredModel: activeModelName
-        })
-      });
+      let data: any = null;
+      let modelUsed: string = activeModelName;
 
-      const json = await res.json();
-      if (!res.ok) {
-        throw new Error(json.error || 'Chyba serverového OCR');
+      // 1. Try server OCR route (if running with Express backend)
+      try {
+        const res = await fetch('/api/ocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            imageBase64: dataUrl,
+            mimeType: 'image/jpeg',
+            userApiKey: userApiKey || undefined,
+            preferredModel: activeModelName
+          })
+        });
+        if (res.ok) {
+          const json = await res.json();
+          data = json.data;
+          modelUsed = json.modelUsed || activeModelName;
+        }
+      } catch {
+        // Backend not available (e.g. GitHub Pages static host)
       }
 
-      const { data, modelUsed } = json;
+      // 2. Fallback to client-side Gemini OCR (e.g. on GitHub Pages)
+      if (!data) {
+        if (!userApiKey) {
+          throw new Error('Pro OCR skenování na GitHub Pages zadejte Gemini API klíč v Nastavení nebo se připojte ke svému Google Sešitu (list Nastaveni_API).');
+        }
+        setScanStatus(`Čtu formulář v prohlížeči (${activeModelName})...`);
+        const clientRes = await runClientGeminiOcr(
+          dataUrl,
+          userApiKey,
+          activeModelName,
+          'image/jpeg'
+        );
+        data = clientRes.data;
+        modelUsed = clientRes.modelUsed;
+      }
+
       setActiveModelName(modelUsed || activeModelName);
 
       // Prepare detected accommodation values
@@ -757,26 +934,9 @@ export default function App() {
       const matchedProperty = findMatchingProperty(data, properties);
 
       if (matchedProperty) {
-        // Direct match: Assign to matched property and save to server
-        const assignedGuests = parsedGuests.map((g: any) => ({ ...g, propertyId: matchedProperty.id }));
-        const batchRes = await fetch('/api/batch-guests', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            property: matchedProperty,
-            guests: assignedGuests
-          })
-        });
-
-        if (batchRes.ok) {
-          const batchData = await batchRes.json();
-          setProperties(batchData.properties);
-          setGuests(batchData.guests);
-          setActivePropertyId(matchedProperty.id);
-          syncToSheetIfConnected(batchData.properties, batchData.guests);
-          showToast(`Lístek přiřazen k ubytování "${matchedProperty.name}" (${assignedGuests.length} hostů)!`, 'success');
-          setActiveTab('ledger');
-        }
+        await saveBatchGuests(matchedProperty, parsedGuests);
+        showToast(`Lístek přiřazen k ubytování "${matchedProperty.name}" (${parsedGuests.length} hostů)!`, 'success');
+        setActiveTab('ledger');
       } else {
         // Discrepancy or no accommodation yet: open confirmation dialog
         setPendingScanData({
@@ -875,32 +1035,13 @@ export default function App() {
         };
       }
 
-      const assignedGuests = pendingScanData.guests.map((g: any) => ({ ...g, propertyId: targetProp!.id }));
-
-      const batchRes = await fetch('/api/batch-guests', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          property: targetProp,
-          guests: assignedGuests
-        })
-      });
-
-      if (batchRes.ok) {
-        const batchData = await batchRes.json();
-        setProperties(batchData.properties);
-        setGuests(batchData.guests);
-        setActivePropertyId(targetProp.id);
-        setIsScanConfirmModalOpen(false);
-        setPendingScanData(null);
-        syncToSheetIfConnected(batchData.properties, batchData.guests);
-        showToast(`Uloženo ${assignedGuests.length} hostů pro "${targetProp.name}"!`, 'success');
-        setActiveTab('ledger');
-      } else {
-        showToast('Chyba při ukládání na server.', 'warning');
-      }
+      await saveBatchGuests(targetProp, pendingScanData.guests);
+      setIsScanConfirmModalOpen(false);
+      setPendingScanData(null);
+      showToast(`Uloženo ${pendingScanData.guests.length} hostů pro "${targetProp.name}"!`, 'success');
+      setActiveTab('ledger');
     } catch (err: any) {
-      showToast('Chyba spojení: ' + err.message, 'warning');
+      showToast('Chyba: ' + err.message, 'warning');
     }
   };
 
@@ -997,35 +1138,68 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
     showToast('CSV tabulka byla stažena.', 'success');
   };
 
-  // Download YAML
+  // Download YAML (works on static hosts and fullstack)
   const handleDownloadYaml = () => {
-    window.location.href = '/api/export/yaml';
-    showToast('Stahuji data.yaml...', 'info');
+    try {
+      const exportData = {
+        meta: {
+          version: '3.0',
+          description: 'AirTax Praha - Evidence ubytovaných a poplatků z pobytu',
+          lastUpdated: new Date().toISOString(),
+          activePropertyId
+        },
+        properties,
+        guests
+      };
+      const yamlStr = jsyaml.dump(exportData, { indent: 2 });
+      const blob = new Blob([yamlStr], { type: 'text/yaml;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `AirTax_zaloha_${new Date().toISOString().slice(0, 10)}.yaml`;
+      link.click();
+      URL.revokeObjectURL(url);
+      showToast('Záložní soubor data.yaml byl stažen.', 'success');
+    } catch (err: any) {
+      showToast('Chyba při exportu YAML: ' + err.message, 'warning');
+    }
   };
 
-  // Import YAML file
+  // Import YAML file (works on static hosts and fullstack)
   const handleImportYamlFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
       const text = await file.text();
-      const res = await fetch('/api/import/yaml', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ yamlContent: text })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setProperties(data.properties);
-        setGuests(data.guests);
-        setActivePropertyId(data.activePropertyId);
-        setIsDataModalOpen(false);
-        showToast('Data byla úspěšně načtena ze souboru!', 'success');
-      } else {
-        showToast('Chyba při importu YAML.', 'warning');
+      const parsed = jsyaml.load(text) as any;
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('Neplatný formát souboru YAML');
       }
+
+      const importedProps: Property[] = Array.isArray(parsed.properties) ? parsed.properties : [];
+      const importedGuests: Guest[] = Array.isArray(parsed.guests) ? parsed.guests : [];
+      const newActiveId = parsed.meta?.activePropertyId || importedProps[0]?.id || '';
+
+      // Try server import if available
+      try {
+        await fetch('/api/import/yaml', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ yamlContent: text })
+        });
+      } catch {
+        // Static hosting fallback (GitHub Pages)
+      }
+
+      setProperties(importedProps);
+      setGuests(importedGuests);
+      setActivePropertyId(newActiveId);
+      persistLocalState(importedProps, importedGuests, newActiveId);
+      syncToSheetIfConnected(importedProps, importedGuests);
+      setIsDataModalOpen(false);
+      showToast(`Data úspěšně importována (${importedProps.length} ubytování, ${importedGuests.length} hostů)!`, 'success');
     } catch (err: any) {
-      showToast('Chyba: ' + err.message, 'warning');
+      showToast('Chyba při importu: ' + err.message, 'warning');
     }
     e.target.value = '';
   };
