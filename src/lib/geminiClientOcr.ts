@@ -149,3 +149,114 @@ export async function runClientGeminiOcr(
     modelUsed: usedModel
   };
 }
+
+export interface GeminiModelInfo {
+  name: string; // e.g. "gemini-2.5-flash"
+  displayName: string;
+  description?: string;
+  isRecommended?: boolean;
+}
+
+export const CURATED_OCR_MODELS: GeminiModelInfo[] = [
+  {
+    name: 'gemini-2.5-flash',
+    displayName: 'Gemini 2.5 Flash',
+    description: 'Nejnovější model s bleskovou rychlostí a vysokou přesností čtení.',
+    isRecommended: true
+  },
+  {
+    name: 'gemini-2.0-flash',
+    displayName: 'Gemini 2.0 Flash',
+    description: 'Rychlý multimodální model pro standardní dokumenty a formuláře.',
+    isRecommended: true
+  },
+  {
+    name: 'gemini-flash-latest',
+    displayName: 'Gemini Flash Latest',
+    description: 'Dynamický alias vždy směřující na nejnovější stabilní verzi Flash.',
+    isRecommended: true
+  },
+  {
+    name: 'gemini-2.5-pro',
+    displayName: 'Gemini 2.5 Pro',
+    description: 'Maximální analytická přesnost pro obtížně čitelné a ručně psané lístky.',
+    isRecommended: false
+  },
+  {
+    name: 'gemini-1.5-flash',
+    displayName: 'Gemini 1.5 Flash',
+    description: 'Osvědčený lehký model s dlouhým kontextem.',
+    isRecommended: false
+  },
+  {
+    name: 'gemini-1.5-pro',
+    displayName: 'Gemini 1.5 Pro',
+    description: 'Pokročilý multimodální model pro komplexní úlohy.',
+    isRecommended: false
+  }
+];
+
+/**
+ * Fetches available Gemini models using the user's API key
+ */
+export async function fetchAvailableGeminiModels(apiKey: string): Promise<GeminiModelInfo[]> {
+  const cleanKey = apiKey.trim();
+  if (!cleanKey) {
+    throw new Error('Chybí Gemini API klíč. Zadejte jej prosím v nastavení nebo připojte Google Sheet.');
+  }
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(cleanKey)}`
+  );
+
+  if (!response.ok) {
+    let errMsg = `Chyba při komunikaci s Gemini API (kód ${response.status})`;
+    try {
+      const errJson = await response.json();
+      if (errJson?.error?.message) {
+        errMsg = errJson.error.message;
+      }
+    } catch {
+      // ignore json parse error
+    }
+    throw new Error(errMsg);
+  }
+
+  const data = await response.json();
+  const rawModels: any[] = Array.isArray(data.models) ? data.models : [];
+
+  // Filter models that support content generation and are multimodal/gemini
+  const validModels = rawModels.filter((m: any) => {
+    const methods: string[] = Array.isArray(m.supportedGenerationMethods) ? m.supportedGenerationMethods : [];
+    const name: string = m.name || '';
+    const hasGenContent = methods.includes('generateContent');
+    const isGemini = /gemini/i.test(name);
+    const isNotUnsupported = !/embedding|aqa|imagen|learnlm|robotics/i.test(name);
+    return hasGenContent && isGemini && isNotUnsupported;
+  });
+
+  if (validModels.length === 0) {
+    return CURATED_OCR_MODELS;
+  }
+
+  const parsedList: GeminiModelInfo[] = validModels.map((m: any) => {
+    const cleanId = String(m.name || '').replace(/^models\//, '');
+    const isRecommended = /2\.5-flash|2\.0-flash|flash-latest/i.test(cleanId);
+    return {
+      name: cleanId,
+      displayName: m.displayName || cleanId,
+      description: m.description || '',
+      isRecommended
+    };
+  });
+
+  // Sort: recommended first, then alphabetically
+  parsedList.sort((a, b) => {
+    if (a.isRecommended && !b.isRecommended) return -1;
+    if (!a.isRecommended && b.isRecommended) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  return parsedList;
+}
+

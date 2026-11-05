@@ -50,9 +50,17 @@ import {
   syncAllToGoogleSheet,
   saveApiKeyToSheet,
   saveSettingsToSheet,
+  saveModelToSheet,
   SpreadsheetInfo
 } from './lib/googleSheets';
-import { runClientGeminiOcr } from './lib/geminiClientOcr';
+import {
+  runClientGeminiOcr,
+  GeminiModelInfo,
+  CURATED_OCR_MODELS,
+  fetchAvailableGeminiModels
+} from './lib/geminiClientOcr';
+
+export const APP_VERSION = '1.0.0';
 
 // Safe localStorage wrapper for Google Sites iframe sandboxes
 const safeStorage = {
@@ -122,6 +130,11 @@ export default function App() {
 
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState<boolean>(false);
   const [isMissingKeyModalOpen, setIsMissingKeyModalOpen] = useState<boolean>(false);
+  const [isModelSelectorOpen, setIsModelSelectorOpen] = useState<boolean>(false);
+  const [availableModels, setAvailableModels] = useState<GeminiModelInfo[]>(CURATED_OCR_MODELS);
+  const [isLoadingModels, setIsLoadingModels] = useState<boolean>(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [modelSearchQuery, setModelSearchQuery] = useState<string>('');
   const [isDataModalOpen, setIsDataModalOpen] = useState<boolean>(false);
   const [isWebcamOpen, setIsWebcamOpen] = useState<boolean>(false);
   const [isDesktopCameraPromptOpen, setIsDesktopCameraPromptOpen] = useState<boolean>(false);
@@ -717,6 +730,45 @@ export default function App() {
     return false;
   };
 
+  // Open Model Selector: load available models with user API key
+  const handleOpenModelSelector = async () => {
+    if (!userApiKey || !userApiKey.trim()) {
+      setIsMissingKeyModalOpen(true);
+      return;
+    }
+    setIsModelSelectorOpen(true);
+    setIsLoadingModels(true);
+    setModelsError(null);
+    try {
+      const list = await fetchAvailableGeminiModels(userApiKey);
+      setAvailableModels(list);
+    } catch (err: any) {
+      console.warn('Failed to fetch models from API, falling back to curated list:', err);
+      setModelsError(err.message || 'Nepodařilo se načíst seznam modelů z Google API.');
+      setAvailableModels(CURATED_OCR_MODELS);
+    } finally {
+      setIsLoadingModels(false);
+    }
+  };
+
+  // User picked a model: save locally and write to Google Sheet in tab Nastaveni
+  const handleSelectModel = async (modelName: string) => {
+    setActiveModelName(modelName);
+    safeStorage.setItem('airtax_model_pref', modelName);
+    setIsModelSelectorOpen(false);
+
+    if (connectedSheet && googleToken) {
+      try {
+        await saveModelToSheet(googleToken, connectedSheet.id, modelName);
+        showToast(`Model byl nastaven na ${modelName} a uložen do Sešitu.`, 'success');
+      } catch (err: any) {
+        showToast(`Model nastaven lokálně (zápis do Sheetu selhal: ${err.message})`, 'warning');
+      }
+    } else {
+      showToast(`Model ${modelName} byl aktivován.`, 'success');
+    }
+  };
+
   // Trigger Camera / Photo Picker (On-Demand only, verified API key)
   const handleTakePhotoClick = () => {
     if (!checkApiKeyOrPrompt()) return;
@@ -1306,22 +1358,31 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
     <div className="flex flex-col h-full bg-[#0A0E17] text-slate-100 font-sans selection:bg-rose-500 selection:text-white">
 
       {/* TOP HEADER */}
-      <header className="sticky top-0 z-40 bg-[#0D131F] border-b border-slate-800/90 px-3 sm:px-4 pt-[calc(0.65rem+env(safe-area-inset-top,0px))] pb-2.5 sm:pb-3 shadow-md select-none">
+      <header className="header-sharp sticky top-0 z-40 bg-[#0D131F] border-b border-slate-800 px-3 sm:px-4 pt-[max(12px,env(safe-area-inset-top,12px))] pb-2.5 sm:pb-3 shadow-md">
         <div className="max-w-2xl mx-auto flex items-center justify-between gap-2">
-          {/* Brand & Status (Red icon removed, optimized for iPhone 12 width) */}
+          {/* Brand & Status (AirTax v1.0.0, sharp typography, clickable model selector) */}
           <div className="flex flex-col justify-center min-w-0 pr-1">
             <div className="flex items-center gap-1.5 leading-none">
-              <h1 className="text-sm font-bold tracking-tight text-white whitespace-nowrap">AirTax Praha</h1>
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 font-bold border border-rose-500/30 whitespace-nowrap">
+              <h1 className="text-base font-extrabold tracking-tight text-white whitespace-nowrap">AirTax</h1>
+              <span className="text-[10px] font-mono font-semibold px-1 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/60 leading-none">
+                v{APP_VERSION}
+              </span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 font-bold border border-rose-500/30 whitespace-nowrap leading-none">
                 {feePerNight} Kč/noc
               </span>
             </div>
-            <div className="flex items-center gap-1.5 mt-1 text-[10px] text-slate-400 leading-tight">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0"></span>
-              <span className="hidden sm:inline font-medium">Cloud Sync aktivní</span>
-              <span className="sm:hidden font-medium">Sync</span>
-              <span className="text-slate-600">•</span>
-              <span className="text-emerald-400 font-mono font-medium truncate max-w-[95px] sm:max-w-[160px]">{activeModelName}</span>
+            <div className="flex items-center gap-1.5 mt-1 text-[11px] text-slate-400 leading-tight">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+              <button
+                type="button"
+                onClick={handleOpenModelSelector}
+                className="flex items-center gap-1 text-emerald-400 hover:text-emerald-300 font-mono font-semibold truncate max-w-[150px] sm:max-w-[220px] tap-active cursor-pointer group"
+                title="Klikněte pro výběr a konfiguraci modelu Gemini"
+              >
+                <span className="text-slate-400 font-sans font-normal text-[10px]">Model:</span>
+                <span className="truncate underline decoration-emerald-500/40 underline-offset-2">{activeModelName}</span>
+                <ChevronDown className="w-3 h-3 shrink-0 text-emerald-400/80 group-hover:text-emerald-300" />
+              </button>
             </div>
           </div>
 
@@ -1485,10 +1546,6 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
               className="relative overflow-hidden rounded-3xl bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-800 p-5 shadow-xl transition-all"
             >
               <div className="text-center space-y-1.5 mb-4">
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                  <Zap className="w-3.5 h-3.5" />
-                  <span>Dynamické OCR: {activeModelName}</span>
-                </div>
                 <h2 className="text-base font-bold text-white">Naskenovat Registration Form</h2>
                 <p className="text-xs text-slate-400">
                   Vyfoťte ubytovací lístek fotoaparátem nebo jej sem přetáhněte. Termín se automaticky přiřadí všem osobám na lístku.
@@ -1870,16 +1927,16 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
           <div className="rounded-3xl bg-slate-900 border border-slate-800 p-5 space-y-4 shadow-xl">
             <div className="flex items-center gap-2 text-rose-400">
               <ShieldCheck className="w-5 h-5" />
-              <h2 className="text-base font-bold text-white">Pravidla odvodu & Dynamické OCR</h2>
+              <h2 className="text-base font-bold text-white">Nápověda & vyhláška o poplatku</h2>
             </div>
 
             <div className="space-y-2 border-b border-slate-800 pb-3">
               <h3 className="text-xs font-bold text-emerald-400 flex items-center gap-1.5">
                 <Zap className="w-3.5 h-3.5" />
-                Dynamický výběr levného OCR modelu
+                OCR model Gemini
               </h3>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Aplikace používá primární alias <code>gemini-flash-latest</code>, který automaticky směruje na nejnovější a nejúspornější Flash model. V případě změny tarifu nebo nedostupnosti model plynule přechází na <code>gemini-3.8-flash</code> nebo <code>gemini-3.1-flash-lite</code>.
+                Aktivní model můžete kdykoliv zkontrolovat a změnit v záhlaví vlevo nahoře pod názvem aplikace. Výběr se automaticky synchronizuje s vaším Google Sheetem do listu <code>Nastaveni</code>.
               </p>
             </div>
 
@@ -1952,7 +2009,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
             }`}
           >
             <HelpCircle className="w-5 h-5" />
-            <span className="text-[10px] mt-1">Pravidla</span>
+            <span className="text-[10px] mt-1">Nápověda</span>
           </button>
         </div>
       </nav>
@@ -2634,6 +2691,140 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
               >
                 <Edit3 className="w-3.5 h-3.5" />
                 <span>Přeskočit k ručnímu zápisu hosta</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODEL SELECTOR MODAL */}
+      {isModelSelectorOpen && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="bg-[#0D131F] border border-slate-800 rounded-t-3xl sm:rounded-2xl max-w-lg w-full p-5 space-y-4 shadow-2xl max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 flex items-center justify-center shrink-0">
+                  <Zap className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Výběr modelu Gemini OCR</h3>
+                  <p className="text-[11px] text-slate-400">Modely ověřené s vaším API klíčem</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsModelSelectorOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center tap-active"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Error notice if API call failed */}
+            {modelsError && (
+              <div className="bg-amber-950/40 border border-amber-500/30 rounded-xl p-3 text-xs text-amber-300 space-y-1 shrink-0">
+                <div className="flex items-center gap-1.5 font-bold">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Seznam z API se nepodařilo načíst online</span>
+                </div>
+                <p className="text-[11px] text-amber-300/80">{modelsError}</p>
+                <p className="text-[11px] text-slate-400">Můžete si vybrat z doporučených ověřených modelů níže.</p>
+              </div>
+            )}
+
+            {/* Search filter if many models */}
+            {availableModels.length > 4 && (
+              <div className="shrink-0">
+                <input
+                  type="text"
+                  value={modelSearchQuery}
+                  onChange={e => setModelSearchQuery(e.target.value)}
+                  placeholder="Filtrovat model (např. flash, pro, 2.5)..."
+                  className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+            )}
+
+            {/* Models list */}
+            <div className="flex-1 overflow-y-auto no-scrollbar space-y-2 pr-0.5 min-h-[160px]">
+              {isLoadingModels ? (
+                <div className="py-14 flex flex-col items-center justify-center space-y-3 text-slate-400 text-xs">
+                  <RefreshCw className="w-6 h-6 text-emerald-400 animate-spin" />
+                  <span>Dotazuji Gemini API na dostupné modely...</span>
+                </div>
+              ) : (
+                availableModels
+                  .filter(m =>
+                    !modelSearchQuery ||
+                    m.name.toLowerCase().includes(modelSearchQuery.toLowerCase()) ||
+                    m.displayName.toLowerCase().includes(modelSearchQuery.toLowerCase())
+                  )
+                  .map(m => {
+                    const isSelected = activeModelName === m.name;
+                    return (
+                      <div
+                        key={m.name}
+                        onClick={() => handleSelectModel(m.name)}
+                        className={`p-3 rounded-xl border transition-all cursor-pointer tap-active flex items-start justify-between gap-3 ${
+                          isSelected
+                            ? 'bg-emerald-950/40 border-emerald-500/60 shadow-sm'
+                            : 'bg-slate-900/70 hover:bg-slate-800/80 border-slate-800'
+                        }`}
+                      >
+                        <div className="space-y-1 min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-mono text-xs font-bold text-white">{m.name}</span>
+                            {isSelected && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/40">
+                                Aktivní
+                              </span>
+                            )}
+                            {m.isRecommended && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-300 font-semibold border border-indigo-500/30">
+                                Doporučeno
+                              </span>
+                            )}
+                          </div>
+                          {m.description && (
+                            <p className="text-[11px] text-slate-400 leading-relaxed line-clamp-2">
+                              {m.description}
+                            </p>
+                          )}
+                        </div>
+                        <div
+                          className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 mt-0.5 ${
+                            isSelected
+                              ? 'border-emerald-400 bg-emerald-500 text-slate-950'
+                              : 'border-slate-700 bg-slate-800'
+                          }`}
+                        >
+                          {isSelected && <Check className="w-3 h-3 stroke-[3]" />}
+                        </div>
+                      </div>
+                    );
+                  })
+              )}
+            </div>
+
+            {/* Modal footer */}
+            <div className="pt-2 border-t border-slate-800 text-[11px] text-slate-400 flex items-center justify-between shrink-0">
+              <div>
+                {connectedSheet ? (
+                  <span className="text-emerald-400 flex items-center gap-1 font-medium">
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>Ukládá se do listu Nastaveni</span>
+                  </span>
+                ) : (
+                  <span>Ukládá se do paměti aplikace</span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={handleOpenModelSelector}
+                disabled={isLoadingModels}
+                className="text-xs text-slate-300 hover:text-white flex items-center gap-1 tap-active cursor-pointer"
+              >
+                <RefreshCw className={`w-3 h-3 ${isLoadingModels ? 'animate-spin' : ''}`} />
+                <span>Aktualizovat</span>
               </button>
             </div>
           </div>

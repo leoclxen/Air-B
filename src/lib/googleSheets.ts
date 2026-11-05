@@ -131,9 +131,7 @@ export async function findOrCreateAirTaxSpreadsheet(
  */
 async function ensureRequiredSheetsExist(accessToken: string, spreadsheetId: string, currentSheets: any[]) {
   const existingTitles = currentSheets.map(s => s.properties?.title);
-  const hasSettings = existingTitles.some((t: string) => /nastaven/i.test(t));
-  const required = ['Ubytovani', 'Hoste', 'Prehled_odvodu'];
-  if (!hasSettings) required.push('Nastaveni');
+  const required = ['Ubytovani', 'Hoste', 'Prehled_odvodu', 'Nastaveni'];
   const missing = required.filter(title => !existingTitles.includes(title));
 
   if (missing.length === 0) return;
@@ -250,29 +248,24 @@ export async function loadAllDataFromGoogleSheet(
     console.warn('Failed to query sheet metadata, fallback to defaults', e);
   }
 
-  // Match sheet titles case-insensitively / with variations
-  const findTitle = (pattern: RegExp, fallback: string) => {
-    return sheetTitles.find(t => pattern.test(t)) || fallback;
-  };
-
-  const propSheet = findTitle(/ubytov/i, 'Ubytovani');
-  const guestSheet = findTitle(/host/i, 'Hoste');
-  const settingsSheet = findTitle(/nastaven|api|config/i, 'Nastaveni');
-
-  // If Nastaveni tab is missing completely, create it
-  if (sheetTitles.length > 0 && !sheetTitles.includes(settingsSheet)) {
-    try {
-      await ensureRequiredSheetsExist(accessToken, spreadsheetId, sheetTitles.map(t => ({ properties: { title: t } })));
-    } catch (e) {
-      console.warn('Could not auto-add missing sheet', e);
+  // Ensure strict required sheets exist in spreadsheet
+  if (sheetTitles.length > 0) {
+    const required = ['Ubytovani', 'Hoste', 'Prehled_odvodu', 'Nastaveni'];
+    const missing = required.filter(t => !sheetTitles.includes(t));
+    if (missing.length > 0) {
+      try {
+        await ensureRequiredSheetsExist(accessToken, spreadsheetId, sheetTitles.map(t => ({ properties: { title: t } })));
+      } catch (e) {
+        console.warn('Could not auto-add missing sheet', e);
+      }
     }
   }
 
-  // Read data: ranges quoted with single quotes to support spaces/special chars
+  // Read data strictly from standard sheets
   const ranges = [
-    `'${propSheet}'!A2:F1000`,
-    `'${guestSheet}'!A2:R5000`,
-    `'${settingsSheet}'!A1:E50`
+    'Ubytovani!A2:F1000',
+    'Hoste!A2:R5000',
+    'Nastaveni!A1:C10'
   ];
   const query = ranges.map(r => `ranges=${encodeURIComponent(r)}`).join('&');
 
@@ -288,74 +281,26 @@ export async function loadAllDataFromGoogleSheet(
   const result = await res.json();
   const valueRanges = result.valueRanges || [];
 
-  // Parse Nastaveni first so feePerNight is available for guest calculation
+  // Parse Nastaveni (strict key-value structure)
   const configRows = valueRanges[2]?.values || [];
   let apiKey = '';
   let preferredModel = 'gemini-flash-latest';
   let feePerNight = 50;
 
   for (const row of configRows) {
-    if (!Array.isArray(row)) continue;
+    if (!Array.isArray(row) || row.length < 2) continue;
+    const key = String(row[0] || '').trim();
+    const val = String(row[1] || '').trim();
 
-    // Check all cells in the row for Google/Gemini key format (AIzaSy...)
-    for (const cell of row) {
-      const val = typeof cell === 'string' ? cell.trim() : '';
-      if (/^AIzaSy[A-Za-z0-9_-]{30,45}$/.test(val)) {
-        apiKey = val;
-      }
-    }
-
-    const colA = (row[0] ? String(row[0]) : '').trim();
-    const colB = (row[1] ? String(row[1]) : '').trim();
-    const colC = (row[2] ? String(row[2]) : '').trim();
-
-    const normalizedA = colA.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    if (
-      normalizedA.includes('api') ||
-      normalizedA.includes('klic') ||
-      normalizedA.includes('gemini') ||
-      normalizedA.includes('key')
-    ) {
-      if (!apiKey) {
-        if (colB && colB.length > 10) apiKey = colB;
-        else if (colC && colC.length > 10) apiKey = colC;
-      }
-    }
-
-    if (normalizedA.includes('model') && colB) {
-      preferredModel = colB;
-    }
-
-    // Configurable fee per night (e.g. POPLATEK_ZA_NOC, POPLATEK, SAZBA, FEE)
-    if (
-      normalizedA.includes('poplatek') ||
-      normalizedA.includes('sazba') ||
-      normalizedA.includes('fee') ||
-      normalizedA.includes('noc')
-    ) {
-      const parsedFee = parseInt(colB) || parseInt(colC);
+    if (key === 'GEMINI_API_KEY') {
+      apiKey = val;
+    } else if (key === 'PREFEROVANY_MODEL' && val) {
+      preferredModel = val;
+    } else if (key === 'POPLATEK_ZA_NOC') {
+      const parsedFee = parseInt(val, 10);
       if (!isNaN(parsedFee) && parsedFee > 0) {
         feePerNight = parsedFee;
       }
-    }
-  }
-
-  // Fallback: search ALL retrieved valueRanges for any cell starting with AIzaSy...
-  if (!apiKey) {
-    for (const vr of valueRanges) {
-      const rows = vr?.values || [];
-      for (const row of rows) {
-        if (!Array.isArray(row)) continue;
-        for (const cell of row) {
-          const val = typeof cell === 'string' ? cell.trim() : '';
-          if (/^AIzaSy[A-Za-z0-9_-]{30,45}$/.test(val)) {
-            apiKey = val;
-            break;
-          }
-        }
-        if (apiKey) break;
-      }
-      if (apiKey) break;
     }
   }
 
@@ -551,6 +496,25 @@ export async function saveSettingsToSheet(
     headers,
     body: JSON.stringify({ values: rows })
   });
+}
+
+/**
+ * Specifically save preferred model to Nastaveni tab row 3
+ */
+export async function saveModelToSheet(
+  accessToken: string,
+  spreadsheetId: string,
+  preferredModel: string
+): Promise<void> {
+  const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
+  await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Nastaveni!B3?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ values: [[preferredModel]] })
+    }
+  );
 }
 
 // Backward-compatible alias
