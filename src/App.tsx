@@ -35,7 +35,14 @@ import {
 } from 'lucide-react';
 import { Property, Guest, PRAGUE_DISTRICTS, generateCzechIBAN } from './types';
 import { User } from 'firebase/auth';
-import { initAuth, googleSignIn, googleLogout, getAccessToken } from './lib/googleAuth';
+import {
+  initAuth,
+  googleSignIn,
+  googleLogout,
+  getAccessToken,
+  firebaseProjectId,
+  firebaseConsoleAuthorizedDomainsUrl
+} from './lib/googleAuth';
 import {
   findOrCreateAirTaxSpreadsheet,
   loadAllDataFromGoogleSheet,
@@ -111,6 +118,7 @@ export default function App() {
   const [isDataModalOpen, setIsDataModalOpen] = useState<boolean>(false);
   const [isWebcamOpen, setIsWebcamOpen] = useState<boolean>(false);
   const [isDesktopCameraPromptOpen, setIsDesktopCameraPromptOpen] = useState<boolean>(false);
+  const [isDomainModalOpen, setIsDomainModalOpen] = useState<boolean>(false);
 
   // Scan Verification / Accommodation Match Modal State
   const [isScanConfirmModalOpen, setIsScanConfirmModalOpen] = useState<boolean>(false);
@@ -243,20 +251,26 @@ export default function App() {
       // Read current content from sheet
       const sheetData = await loadAllDataFromGoogleSheet(token, sheet.id);
 
-      // If sheet has properties/guests or API key, update local & server state
+      // ALWAYS load API key and preferred model from sheet if found!
+      let loadedKey = false;
+      if (sheetData.apiKey && sheetData.apiKey.trim().length > 0) {
+        const cleanKey = sheetData.apiKey.trim();
+        setUserApiKey(cleanKey);
+        safeStorage.setItem('airtax_user_api_key', cleanKey);
+        loadedKey = true;
+      }
+      if (sheetData.preferredModel && sheetData.preferredModel.trim().length > 0) {
+        const cleanModel = sheetData.preferredModel.trim();
+        setActiveModelName(cleanModel);
+        safeStorage.setItem('airtax_model_pref', cleanModel);
+      }
+
+      // If sheet has properties/guests, update local & server state
       if (sheetData.properties.length > 0 || sheetData.guests.length > 0) {
         setProperties(sheetData.properties);
         setGuests(sheetData.guests);
         if (sheetData.properties[0]) {
           setActivePropertyId(sheetData.properties[0].id);
-        }
-        if (sheetData.apiKey) {
-          setUserApiKey(sheetData.apiKey);
-          safeStorage.setItem('airtax_user_api_key', sheetData.apiKey);
-        }
-        if (sheetData.preferredModel) {
-          setActiveModelName(sheetData.preferredModel);
-          safeStorage.setItem('airtax_model_pref', sheetData.preferredModel);
         }
         // Persist to server data.yaml
         fetch('/api/import/yaml', {
@@ -271,16 +285,20 @@ export default function App() {
           })
         }).catch(err => console.warn('Server sync error', err));
 
-        showToast(`Načteno z Google Sheetu: ${sheetData.properties.length} ubytování, ${sheetData.guests.length} hostů!`, 'success');
-      } else if (properties.length > 0 || guests.length > 0 || userApiKey) {
-        // Sheet was empty, push local state to the sheet
+        const keyMsg = loadedKey ? ' a Gemini API klíč' : '';
+        showToast(`Načteno z Google Sheetu: ${sheetData.properties.length} ubytování, ${sheetData.guests.length} hostů${keyMsg}!`, 'success');
+      } else if (properties.length > 0 || guests.length > 0) {
+        // Sheet has no properties/guests yet, push local state to the sheet without wiping API key
         await syncAllToGoogleSheet(token, sheet.id, {
           properties,
           guests,
-          apiKey: userApiKey,
-          preferredModel: activeModelName
+          apiKey: sheetData.apiKey || userApiKey,
+          preferredModel: sheetData.preferredModel || activeModelName
         });
-        showToast('Google Sheet inicializován a synchronizován s vašimi daty!', 'success');
+        const keyMsg = loadedKey ? ' API klíč byl úspěšně načten ze Sheetu.' : '';
+        showToast(`Google Sheet inicializován a synchronizován s vašimi daty.${keyMsg}`, 'success');
+      } else if (loadedKey) {
+        showToast('Google Sheet propojen a API klíč Gemini byl úspěšně načten!', 'success');
       } else {
         showToast('Google Sheet propojen a připraven k zápisu.', 'info');
       }
@@ -302,7 +320,11 @@ export default function App() {
         await autoConnectSheet(res.accessToken);
       }
     } catch (err: any) {
-      showToast('Přihlášení k Google selhalo: ' + err.message, 'warning');
+      if (err?.code === 'auth/unauthorized-domain' || err?.message?.includes('unauthorized-domain')) {
+        setIsDomainModalOpen(true);
+      } else {
+        showToast('Přihlášení k Google selhalo: ' + (err.message || err), 'warning');
+      }
     } finally {
       setIsGoogleLoading(false);
     }
@@ -1241,16 +1263,16 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
     <div className="flex flex-col h-full bg-[#0A0E17] text-slate-100 font-sans selection:bg-rose-500 selection:text-white">
 
       {/* TOP HEADER */}
-      <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800/80 px-4 py-3">
+      <header className="sticky top-0 z-40 bg-[#0D131F] border-b border-slate-800/90 px-4 pt-[calc(0.75rem+env(safe-area-inset-top,0px))] pb-3 shadow-md select-none">
         <div className="max-w-2xl mx-auto flex items-center justify-between">
           <div className="flex items-center space-x-2.5">
-            <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-[#FF385C] to-rose-600 flex items-center justify-center shadow-lg shadow-rose-600/30">
+            <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-[#FF385C] to-rose-600 flex items-center justify-center shadow-md shadow-rose-600/30 shrink-0">
               <Scan className="w-4 h-4 text-white" />
             </div>
             <div>
               <div className="flex items-center gap-1.5 leading-none">
                 <h1 className="text-sm font-bold tracking-tight text-white">AirTax Praha</h1>
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/10 text-rose-400 font-bold border border-rose-500/20">
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 font-bold border border-rose-500/30">
                   50 Kč/noc
                 </span>
               </div>
@@ -1266,7 +1288,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
           <div className="flex items-center gap-1.5">
             {/* Google Sheets Status / Connect Button */}
             {currentUser && connectedSheet ? (
-              <div className="flex items-center gap-1 bg-emerald-950/40 border border-emerald-500/30 rounded-full px-2 py-1">
+              <div className="flex items-center gap-1.5 bg-emerald-950/60 border border-emerald-500/40 rounded-xl px-2.5 py-1.5 shadow-sm">
                 <a
                   href={connectedSheet.url}
                   target="_blank"
@@ -1276,22 +1298,22 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                   <span className="hidden sm:inline">Sheet</span>
-                  <ExternalLink className="w-2.5 h-2.5 opacity-70 shrink-0" />
+                  <ExternalLink className="w-2.5 h-2.5 opacity-75 shrink-0" />
                 </a>
                 <button
                   onClick={() => autoConnectSheet(googleToken!)}
                   disabled={isSyncingSheet}
-                  className="p-0.5 text-emerald-400 hover:text-white tap-active"
+                  className="p-0.5 text-emerald-400 hover:text-white tap-active cursor-pointer"
                   title="Znovu načíst data ze Sešitu"
                 >
-                  <RefreshCw className={`w-3 h-3 ${isSyncingSheet ? 'animate-spin' : ''}`} />
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingSheet ? 'animate-spin' : ''}`} />
                 </button>
               </div>
             ) : (
               <button
                 onClick={handleGoogleLoginClick}
                 disabled={isGoogleLoading}
-                className="flex items-center gap-1 px-2 py-1 rounded-full bg-slate-800 hover:bg-slate-750 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold tap-active cursor-pointer"
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold tap-active cursor-pointer shadow-sm transition-all"
                 title="Připojit Google Sheet pro automatické ukládání dat a API klíče"
               >
                 <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
@@ -1302,21 +1324,21 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
 
             <button
               onClick={() => setIsDataModalOpen(true)}
-              className="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-750 border border-slate-700 flex items-center justify-center text-slate-300 tap-active"
+              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-slate-200 tap-active cursor-pointer shadow-sm transition-all"
               title="Export & Import dat"
             >
               <Download className="w-4 h-4 text-emerald-400" />
             </button>
             <button
               onClick={() => setIsSettingsModalOpen(true)}
-              className="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-750 border border-slate-700 flex items-center justify-center text-amber-400 tap-active"
+              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-amber-300 tap-active cursor-pointer shadow-sm transition-all"
               title="Nastavení OCR, Google Sheet & Klíče"
             >
               <Sliders className="w-4 h-4 text-amber-400" />
             </button>
             <button
               onClick={() => { setPropModalMode('list'); setIsPropModalOpen(true); }}
-              className="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-750 border border-slate-700 flex items-center justify-center text-slate-300 tap-active"
+              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-slate-200 tap-active cursor-pointer shadow-sm transition-all"
               title="Správa ubytovacích míst"
             >
               <Building className="w-4 h-4 text-rose-400" />
@@ -1543,16 +1565,6 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   <p className="text-[10px] text-rose-300">K úhradě (50 Kč)</p>
                   <p className="text-base font-black text-rose-400 mt-0.5">{totalFee.toLocaleString('cs-CZ')} Kč</p>
                 </div>
-              </div>
-            </div>
-
-            {/* Cloud Persistence Badge */}
-            <div className="rounded-2xl bg-slate-900/40 border border-slate-800/80 p-3.5 flex items-start gap-3">
-              <div className="w-7 h-7 rounded-lg bg-emerald-500/10 text-emerald-400 shrink-0 flex items-center justify-center mt-0.5">
-                <ShieldCheck className="w-4 h-4" />
-              </div>
-              <div className="text-[11px] text-slate-400 leading-relaxed">
-                <strong className="text-slate-200">Automatická synchronizace na Google Sites:</strong> Všechna data se ukládají na centrální cloudový server. Ať otevřete stránku z iPhonu, Androidu nebo Safari na počítači, vidíte ihned totožné aktuální záznamy.
               </div>
             </div>
           </div>
@@ -1862,7 +1874,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
       </main>
 
       {/* BOTTOM NAVIGATION TAB BAR */}
-      <nav className="fixed bottom-0 inset-x-0 bg-slate-900/90 backdrop-blur-xl border-t border-slate-800 px-3 py-2 z-40">
+      <nav className="fixed bottom-0 inset-x-0 bg-[#0D131F] border-t border-slate-800 px-3 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom,0px))] z-40 shadow-lg select-none">
         <div className="max-w-2xl mx-auto grid grid-cols-4 gap-1">
           <button
             onClick={() => setActiveTab('scan')}
@@ -2834,6 +2846,96 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
               >
                 Potvrdit a uložit hosty
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: FIREBASE AUTHORIZED DOMAINS INSTRUCTION */}
+      {isDomainModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 w-full max-w-md rounded-3xl p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-amber-500/10 text-amber-400 flex items-center justify-center">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Povolení domény v Google Firebase</h3>
+                  <p className="text-[11px] text-slate-400">auth/unauthorized-domain</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsDomainModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center tap-active"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Google z bezpečnostních důvodů vyžaduje, aby každá nová adresa, ze které se uživatelé přihlašují k Sešitu (GitHub Pages nebo Google Sites), byla jednorázově přidána do seznamu povolených domén vašeho projektu <strong>{firebaseProjectId}</strong>.
+            </p>
+
+            <div className="p-3 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
+              <span className="text-[10px] uppercase font-bold text-slate-400">Doména k přidání:</span>
+              <div className="flex items-center justify-between bg-slate-900 px-3 py-2 rounded-xl border border-slate-700">
+                <code className="text-xs font-mono text-emerald-400 font-bold">{window.location.hostname}</code>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(window.location.hostname);
+                    showToast('Doména zkopírována do schránky!', 'success');
+                  }}
+                  className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 tap-active"
+                  title="Kopírovat"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5 text-xs text-slate-300">
+              <span className="font-bold text-white text-[11px]">Postup (zabere 30 sekund):</span>
+              <ol className="list-decimal list-inside space-y-1 text-[11px] text-slate-400">
+                <li>Klikněte na tlačítko <strong>Otevřít Firebase Console</strong> níže.</li>
+                <li>V sekci <strong>Authorized domains</strong> klikněte na <strong>Add domain</strong>.</li>
+                <li>Vložte <strong className="text-emerald-400">{window.location.hostname}</strong> (a pro Google Sites také <strong className="text-blue-400">sites.google.com</strong>).</li>
+                <li>Klikněte na <strong>Add (Uložit)</strong> a vraťte se sem.</li>
+              </ol>
+            </div>
+
+            <div className="pt-2 space-y-2">
+              <a
+                href={firebaseConsoleAuthorizedDomainsUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full py-2.5 px-4 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 rounded-xl text-xs font-bold shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2 tap-active text-center"
+              >
+                <span>Otevřít Firebase Console (Povolené domény)</span>
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsDomainModalOpen(false)}
+                  className="w-1/3 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 rounded-xl text-xs font-semibold tap-active"
+                >
+                  Zavřít
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsDomainModalOpen(false);
+                    handleGoogleLoginClick();
+                  }}
+                  className="w-2/3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold tap-active flex items-center justify-center gap-1.5"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Zkusit přihlásit znovu</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

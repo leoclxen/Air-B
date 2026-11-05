@@ -153,12 +153,24 @@ async function ensureRequiredSheetsExist(accessToken: string, spreadsheetId: str
   // Write headers to any newly created sheets
   const updateData: any[] = [];
   missing.forEach(sheetName => {
-    const h = (HEADERS as any)[sheetName];
-    if (h) {
+    if (sheetName === 'Nastaveni_API') {
       updateData.push({
-        range: `${sheetName}!A1:${getColumnLetter(h.length)}1`,
-        values: [h]
+        range: `'Nastaveni_API'!A1:C4`,
+        values: [
+          HEADERS.Nastaveni_API,
+          ['GEMINI_API_KEY', '', 'Váš Google Gemini API klíč pro automatické OCR rozpoznávání'],
+          ['PREFEROVANY_MODEL', 'gemini-flash-latest', 'Aktivní model Gemini (gemini-flash-latest / 3.8-flash / 3.1-flash-lite)'],
+          ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas vytvoření listu']
+        ]
       });
+    } else {
+      const h = (HEADERS as any)[sheetName];
+      if (h) {
+        updateData.push({
+          range: `'${sheetName}'!A1:${getColumnLetter(h.length)}1`,
+          values: [h]
+        });
+      }
     }
   });
 
@@ -216,7 +228,46 @@ export async function loadAllDataFromGoogleSheet(
   preferredModel: string;
 }> {
   const headers = { Authorization: `Bearer ${accessToken}` };
-  const ranges = ['Ubytovani!A2:F1000', 'Hoste!A2:R5000', 'Nastaveni_API!A2:B10'];
+
+  // 1. Inspect existing sheet titles from spreadsheet metadata
+  let sheetTitles: string[] = [];
+  try {
+    const metaRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties.title`,
+      { headers }
+    );
+    if (metaRes.ok) {
+      const meta = await metaRes.json();
+      sheetTitles = (meta.sheets || []).map((s: any) => s.properties?.title || '');
+    }
+  } catch (e) {
+    console.warn('Failed to query sheet metadata, fallback to defaults', e);
+  }
+
+  // Match sheet titles case-insensitively / with variations
+  const findTitle = (pattern: RegExp, fallback: string) => {
+    return sheetTitles.find(t => pattern.test(t)) || fallback;
+  };
+
+  const propSheet = findTitle(/ubytov/i, 'Ubytovani');
+  const guestSheet = findTitle(/host/i, 'Hoste');
+  const settingsSheet = findTitle(/nastaven|api|config/i, 'Nastaveni_API');
+
+  // If Nastaveni_API tab is missing completely, create it
+  if (sheetTitles.length > 0 && !sheetTitles.includes(settingsSheet)) {
+    try {
+      await ensureRequiredSheetsExist(accessToken, spreadsheetId, sheetTitles.map(t => ({ properties: { title: t } })));
+    } catch (e) {
+      console.warn('Could not auto-add missing sheet', e);
+    }
+  }
+
+  // Read data: ranges quoted with single quotes to support spaces/special chars
+  const ranges = [
+    `'${propSheet}'!A2:F1000`,
+    `'${guestSheet}'!A2:R5000`,
+    `'${settingsSheet}'!A1:E50`
+  ];
   const query = ranges.map(r => `ranges=${encodeURIComponent(r)}`).join('&');
 
   const res = await fetch(
@@ -272,17 +323,62 @@ export async function loadAllDataFromGoogleSheet(
     };
   }).filter((g: Guest) => (g.lastName || g.firstName || g.idDocumentNumber));
 
-  // Parse Nastaveni_API
+  // Parse Nastaveni_API (robustly checks parameter names, column offsets, and any cell with Gemini API key pattern)
   const configRows = valueRanges[2]?.values || [];
   let apiKey = '';
   let preferredModel = 'gemini-flash-latest';
 
-  configRows.forEach((r: any[]) => {
-    const param = (r[0] || '').trim();
-    const val = (r[1] || '').trim();
-    if (param === 'GEMINI_API_KEY') apiKey = val;
-    if (param === 'PREFEROVANY_MODEL' && val) preferredModel = val;
-  });
+  for (const row of configRows) {
+    if (!Array.isArray(row)) continue;
+
+    // Check all cells in the row for Google/Gemini key format (AIzaSy...)
+    for (const cell of row) {
+      const val = typeof cell === 'string' ? cell.trim() : '';
+      if (/^AIzaSy[A-Za-z0-9_-]{30,45}$/.test(val)) {
+        apiKey = val;
+      }
+    }
+
+    const colA = (row[0] ? String(row[0]) : '').trim();
+    const colB = (row[1] ? String(row[1]) : '').trim();
+    const colC = (row[2] ? String(row[2]) : '').trim();
+
+    const normalizedA = colA.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (
+      normalizedA.includes('api') ||
+      normalizedA.includes('klic') ||
+      normalizedA.includes('gemini') ||
+      normalizedA.includes('key')
+    ) {
+      if (!apiKey) {
+        if (colB && colB.length > 10) apiKey = colB;
+        else if (colC && colC.length > 10) apiKey = colC;
+      }
+    }
+
+    if (normalizedA.includes('model') && colB) {
+      preferredModel = colB;
+    }
+  }
+
+  // Fallback: search ALL retrieved valueRanges for any cell starting with AIzaSy...
+  if (!apiKey) {
+    for (const vr of valueRanges) {
+      const rows = vr?.values || [];
+      for (const row of rows) {
+        if (!Array.isArray(row)) continue;
+        for (const cell of row) {
+          const val = typeof cell === 'string' ? cell.trim() : '';
+          if (/^AIzaSy[A-Za-z0-9_-]{30,45}$/.test(val)) {
+            apiKey = val;
+            break;
+          }
+        }
+        if (apiKey) break;
+      }
+      if (apiKey) break;
+    }
+  }
 
   return { properties, guests, apiKey, preferredModel };
 }
@@ -350,26 +446,36 @@ export async function syncAllToGoogleSheet(
     ];
   });
 
-  // 4. Prepare Nastaveni_API rows
-  const configRows = [
-    ['GEMINI_API_KEY', payload.apiKey || '', 'Váš Google Gemini API klíč pro automatické OCR rozpoznávání'],
-    ['PREFEROVANY_MODEL', payload.preferredModel || 'gemini-flash-latest', 'Aktivní model Gemini'],
-    ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas poslední synchronizace']
-  ];
-
-  // First, clear old contents below headers to avoid orphaned rows
+  // First, clear old contents below headers for data tabs ONLY (DO NOT clear Nastaveni_API to avoid wiping API key)
   await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
     method: 'POST',
     headers,
     body: JSON.stringify({
-      ranges: ['Ubytovani!A2:F500', 'Hoste!A2:R10000', 'Prehled_odvodu!A2:I500', 'Nastaveni_API!A2:C10']
+      ranges: ['Ubytovani!A2:F500', 'Hoste!A2:R10000', 'Prehled_odvodu!A2:I500']
     })
   });
 
-  // Then batch write all rows
-  const data: any[] = [
-    { range: `Nastaveni_API!A2:C${configRows.length + 1}`, values: configRows }
-  ];
+  // Then batch write rows
+  const data: any[] = [];
+
+  // Update Nastaveni_API: only write new API key if provided and non-empty
+  if (payload.apiKey && payload.apiKey.trim().length > 0) {
+    const configRows = [
+      ['GEMINI_API_KEY', payload.apiKey.trim(), 'Váš Google Gemini API klíč pro automatické OCR rozpoznávání'],
+      ['PREFEROVANY_MODEL', payload.preferredModel || 'gemini-flash-latest', 'Aktivní model Gemini'],
+      ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas poslední synchronizace']
+    ];
+    data.push({ range: 'Nastaveni_API!A2:C4', values: configRows });
+  } else {
+    // Only update preferredModel and timestamp, leaving row 2 (GEMINI_API_KEY) intact
+    data.push({
+      range: 'Nastaveni_API!A3:C4',
+      values: [
+        ['PREFEROVANY_MODEL', payload.preferredModel || 'gemini-flash-latest', 'Aktivní model Gemini'],
+        ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas poslední synchronizace']
+      ]
+    });
+  }
 
   if (propRows.length > 0) {
     data.push({ range: `Ubytovani!A2:F${propRows.length + 1}`, values: propRows });

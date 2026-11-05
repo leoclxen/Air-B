@@ -59,3 +59,7 @@ export const googleLogout = async (): Promise<void> => {
   await signOut(auth);
   cachedAccessToken = null;
 };
+
+export const firebaseProjectId = firebaseConfig.projectId;
+export const firebaseConsoleAuthorizedDomainsUrl = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/settings`;
+
