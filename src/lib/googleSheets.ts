@@ -12,6 +12,7 @@ export interface SheetDataPayload {
   guests: Guest[];
   apiKey?: string;
   preferredModel?: string;
+  feePerNight?: number;
 }
 
 const DEFAULT_TITLE = 'AirTax Praha - Evidence ubytovaných';
@@ -28,7 +29,7 @@ const HEADERS = {
     'Mestska_cast', 'Aktivni_ubytovani', 'Celkem_hostu', 'Celkem_noci',
     'Osvobozeno_noci', 'K_uhrade_CZK', 'Cislo_uctu_MC', 'VS_platby', 'Datova_schranka'
   ],
-  Nastaveni_API: ['Klic_parametr', 'Hodnota', 'Popis']
+  Nastaveni: ['Klic_parametr', 'Hodnota', 'Popis']
 };
 
 /**
@@ -101,7 +102,7 @@ export async function findOrCreateAirTaxSpreadsheet(
         { properties: { title: 'Ubytovani', gridProperties: { frozenRowCount: 1 } } },
         { properties: { title: 'Hoste', gridProperties: { frozenRowCount: 1 } } },
         { properties: { title: 'Prehled_odvodu', gridProperties: { frozenRowCount: 1 } } },
-        { properties: { title: 'Nastaveni_API', gridProperties: { frozenRowCount: 1 } } }
+        { properties: { title: 'Nastaveni', gridProperties: { frozenRowCount: 1 } } }
       ]
     })
   });
@@ -130,7 +131,9 @@ export async function findOrCreateAirTaxSpreadsheet(
  */
 async function ensureRequiredSheetsExist(accessToken: string, spreadsheetId: string, currentSheets: any[]) {
   const existingTitles = currentSheets.map(s => s.properties?.title);
-  const required = ['Ubytovani', 'Hoste', 'Prehled_odvodu', 'Nastaveni_API'];
+  const hasSettings = existingTitles.some((t: string) => /nastaven/i.test(t));
+  const required = ['Ubytovani', 'Hoste', 'Prehled_odvodu'];
+  if (!hasSettings) required.push('Nastaveni');
   const missing = required.filter(title => !existingTitles.includes(title));
 
   if (missing.length === 0) return;
@@ -153,13 +156,14 @@ async function ensureRequiredSheetsExist(accessToken: string, spreadsheetId: str
   // Write headers to any newly created sheets
   const updateData: any[] = [];
   missing.forEach(sheetName => {
-    if (sheetName === 'Nastaveni_API') {
+    if (sheetName === 'Nastaveni') {
       updateData.push({
-        range: `'Nastaveni_API'!A1:C4`,
+        range: `'Nastaveni'!A1:C5`,
         values: [
-          HEADERS.Nastaveni_API,
+          HEADERS.Nastaveni,
           ['GEMINI_API_KEY', '', 'Váš Google Gemini API klíč pro automatické OCR rozpoznávání'],
           ['PREFEROVANY_MODEL', 'gemini-flash-latest', 'Aktivní model Gemini (gemini-flash-latest / 3.8-flash / 3.1-flash-lite)'],
+          ['POPLATEK_ZA_NOC', '50', 'Sazba poplatku z pobytu v Kč za noc (výchozí 50 Kč)'],
           ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas vytvoření listu']
         ]
       });
@@ -187,7 +191,7 @@ async function ensureRequiredSheetsExist(accessToken: string, spreadsheetId: str
 }
 
 /**
- * Write initial headers and default Nastaveni_API rows
+ * Write initial headers and default Nastaveni rows
  */
 async function initializeHeadersAndInitialData(accessToken: string, spreadsheetId: string) {
   const data = [
@@ -195,12 +199,13 @@ async function initializeHeadersAndInitialData(accessToken: string, spreadsheetI
     { range: 'Hoste!A1:R1', values: [HEADERS.Hoste] },
     { range: 'Prehled_odvodu!A1:I1', values: [HEADERS.Prehled_odvodu] },
     {
-      range: 'Nastaveni_API!A1:C4',
+      range: 'Nastaveni!A1:C5',
       values: [
-        HEADERS.Nastaveni_API,
+        HEADERS.Nastaveni,
         ['GEMINI_API_KEY', '', 'Váš Google Gemini API klíč pro automatické OCR rozpoznávání'],
         ['PREFEROVANY_MODEL', 'gemini-flash-latest', 'Aktivní model Gemini (gemini-flash-latest / 3.8-flash / 3.1-flash-lite)'],
-        ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas poslední synchronizace']
+        ['POPLATEK_ZA_NOC', '50', 'Sazba poplatku z pobytu v Kč za noc (výchozí 50 Kč)'],
+        ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas vytvoření listu']
       ]
     }
   ];
@@ -226,6 +231,7 @@ export async function loadAllDataFromGoogleSheet(
   guests: Guest[];
   apiKey: string;
   preferredModel: string;
+  feePerNight: number;
 }> {
   const headers = { Authorization: `Bearer ${accessToken}` };
 
@@ -251,9 +257,9 @@ export async function loadAllDataFromGoogleSheet(
 
   const propSheet = findTitle(/ubytov/i, 'Ubytovani');
   const guestSheet = findTitle(/host/i, 'Hoste');
-  const settingsSheet = findTitle(/nastaven|api|config/i, 'Nastaveni_API');
+  const settingsSheet = findTitle(/nastaven|api|config/i, 'Nastaveni');
 
-  // If Nastaveni_API tab is missing completely, create it
+  // If Nastaveni tab is missing completely, create it
   if (sheetTitles.length > 0 && !sheetTitles.includes(settingsSheet)) {
     try {
       await ensureRequiredSheetsExist(accessToken, spreadsheetId, sheetTitles.map(t => ({ properties: { title: t } })));
@@ -282,51 +288,11 @@ export async function loadAllDataFromGoogleSheet(
   const result = await res.json();
   const valueRanges = result.valueRanges || [];
 
-  // Parse Ubytovani
-  const propRows = valueRanges[0]?.values || [];
-  const properties: Property[] = propRows.map((r: any[]) => ({
-    id: r[0] || `prop_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
-    name: r[1] || '',
-    hostName: r[2] || '',
-    address: r[3] || '',
-    districtKey: r[4] || 'praha8',
-    variableSymbol: r[5] || ''
-  })).filter((p: Property) => p.name.trim().length > 0);
-
-  // Parse Hoste
-  const guestRows = valueRanges[1]?.values || [];
-  const guests: Guest[] = guestRows.map((r: any[]) => {
-    const nights = Math.max(1, parseInt(r[14]) || 1);
-    const exemption = (r[15] as any) || 'none';
-    const fee = exemption !== 'none' ? 0 : nights * 50;
-    return {
-      id: r[0] || `g_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
-      propertyId: r[1] || '',
-      unit: r[2] || '',
-      airbnbCode: r[3] || '',
-      lastName: r[4] || '',
-      firstName: r[5] || '',
-      fullName: `${r[5] || ''} ${r[4] || ''}`.trim() || 'Host',
-      birthDate: r[6] || '',
-      nationality: (r[7] || 'CZ').toUpperCase(),
-      purposeOfStay: r[8] || '10 turistika / leisure',
-      idDocumentNumber: r[9] || '',
-      idDocumentType: 'PAS',
-      visaNumber: r[10] || '',
-      address: r[11] || '',
-      dateArrival: r[12] || '',
-      dateDeparture: r[13] || '',
-      nights,
-      exemption,
-      fee: parseInt(r[16]) || fee,
-      createdAt: r[17] || new Date().toISOString()
-    };
-  }).filter((g: Guest) => (g.lastName || g.firstName || g.idDocumentNumber));
-
-  // Parse Nastaveni_API (robustly checks parameter names, column offsets, and any cell with Gemini API key pattern)
+  // Parse Nastaveni first so feePerNight is available for guest calculation
   const configRows = valueRanges[2]?.values || [];
   let apiKey = '';
   let preferredModel = 'gemini-flash-latest';
+  let feePerNight = 50;
 
   for (const row of configRows) {
     if (!Array.isArray(row)) continue;
@@ -359,6 +325,19 @@ export async function loadAllDataFromGoogleSheet(
     if (normalizedA.includes('model') && colB) {
       preferredModel = colB;
     }
+
+    // Configurable fee per night (e.g. POPLATEK_ZA_NOC, POPLATEK, SAZBA, FEE)
+    if (
+      normalizedA.includes('poplatek') ||
+      normalizedA.includes('sazba') ||
+      normalizedA.includes('fee') ||
+      normalizedA.includes('noc')
+    ) {
+      const parsedFee = parseInt(colB) || parseInt(colC);
+      if (!isNaN(parsedFee) && parsedFee > 0) {
+        feePerNight = parsedFee;
+      }
+    }
   }
 
   // Fallback: search ALL retrieved valueRanges for any cell starting with AIzaSy...
@@ -380,11 +359,52 @@ export async function loadAllDataFromGoogleSheet(
     }
   }
 
-  return { properties, guests, apiKey, preferredModel };
+  // Parse Ubytovani
+  const propRows = valueRanges[0]?.values || [];
+  const properties: Property[] = propRows.map((r: any[]) => ({
+    id: r[0] || `prop_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
+    name: r[1] || '',
+    hostName: r[2] || '',
+    address: r[3] || '',
+    districtKey: r[4] || 'praha8',
+    variableSymbol: r[5] || ''
+  })).filter((p: Property) => p.name.trim().length > 0);
+
+  // Parse Hoste
+  const guestRows = valueRanges[1]?.values || [];
+  const guests: Guest[] = guestRows.map((r: any[]) => {
+    const nights = Math.max(1, parseInt(r[14]) || 1);
+    const exemption = (r[15] as any) || 'none';
+    const calculatedFee = exemption !== 'none' ? 0 : nights * feePerNight;
+    return {
+      id: r[0] || `g_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
+      propertyId: r[1] || '',
+      unit: r[2] || '',
+      airbnbCode: r[3] || '',
+      lastName: r[4] || '',
+      firstName: r[5] || '',
+      fullName: `${r[5] || ''} ${r[4] || ''}`.trim() || 'Host',
+      birthDate: r[6] || '',
+      nationality: (r[7] || 'CZ').toUpperCase(),
+      purposeOfStay: r[8] || '10 turistika / leisure',
+      idDocumentNumber: r[9] || '',
+      idDocumentType: 'PAS',
+      visaNumber: r[10] || '',
+      address: r[11] || '',
+      dateArrival: r[12] || '',
+      dateDeparture: r[13] || '',
+      nights,
+      exemption,
+      fee: parseInt(r[16]) || calculatedFee,
+      createdAt: r[17] || new Date().toISOString()
+    };
+  }).filter((g: Guest) => (g.lastName || g.firstName || g.idDocumentNumber));
+
+  return { properties, guests, apiKey, preferredModel, feePerNight };
 }
 
 /**
- * Save all properties and guests to Google Sheet with settlement overview & API key
+ * Save all properties and guests to Google Sheet with settlement overview & settings
  */
 export async function syncAllToGoogleSheet(
   accessToken: string,
@@ -392,6 +412,7 @@ export async function syncAllToGoogleSheet(
   payload: SheetDataPayload
 ): Promise<void> {
   const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
+  const currentFee = payload.feePerNight || 50;
 
   // 1. Prepare Ubytovani rows
   const propRows = payload.properties.map(p => [
@@ -431,7 +452,7 @@ export async function syncAllToGoogleSheet(
     const pGuests = payload.guests.filter(g => g.propertyId === p.id);
     const totalNights = pGuests.reduce((s, g) => s + g.nights, 0);
     const exemptNights = pGuests.reduce((s, g) => s + (g.exemption !== 'none' ? g.nights : 0), 0);
-    const fee = (totalNights - exemptNights) * 50;
+    const fee = (totalNights - exemptNights) * currentFee;
 
     return [
       dist.name,
@@ -446,7 +467,7 @@ export async function syncAllToGoogleSheet(
     ];
   });
 
-  // First, clear old contents below headers for data tabs ONLY (DO NOT clear Nastaveni_API to avoid wiping API key)
+  // First, clear old contents below headers for data tabs ONLY (DO NOT clear Nastaveni to avoid wiping API key)
   await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
     method: 'POST',
     headers,
@@ -458,20 +479,22 @@ export async function syncAllToGoogleSheet(
   // Then batch write rows
   const data: any[] = [];
 
-  // Update Nastaveni_API: only write new API key if provided and non-empty
+  // Update Nastaveni tab
   if (payload.apiKey && payload.apiKey.trim().length > 0) {
     const configRows = [
       ['GEMINI_API_KEY', payload.apiKey.trim(), 'Váš Google Gemini API klíč pro automatické OCR rozpoznávání'],
       ['PREFEROVANY_MODEL', payload.preferredModel || 'gemini-flash-latest', 'Aktivní model Gemini'],
+      ['POPLATEK_ZA_NOC', String(currentFee), 'Sazba poplatku z pobytu v Kč za noc (výchozí 50 Kč)'],
       ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas poslední synchronizace']
     ];
-    data.push({ range: 'Nastaveni_API!A2:C4', values: configRows });
+    data.push({ range: 'Nastaveni!A2:C5', values: configRows });
   } else {
-    // Only update preferredModel and timestamp, leaving row 2 (GEMINI_API_KEY) intact
+    // Only update preferredModel, feePerNight, and timestamp, leaving row 2 (GEMINI_API_KEY) intact
     data.push({
-      range: 'Nastaveni_API!A3:C4',
+      range: 'Nastaveni!A3:C5',
       values: [
         ['PREFEROVANY_MODEL', payload.preferredModel || 'gemini-flash-latest', 'Aktivní model Gemini'],
+        ['POPLATEK_ZA_NOC', String(currentFee), 'Sazba poplatku z pobytu v Kč za noc (výchozí 50 Kč)'],
         ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas poslední synchronizace']
       ]
     });
@@ -506,27 +529,32 @@ export async function syncAllToGoogleSheet(
 }
 
 /**
- * Save API key and preferred model specifically to Nastaveni_API sheet
+ * Save API key, preferred model, and fee per night to Nastaveni sheet
  */
-export async function saveApiKeyToSheet(
+export async function saveSettingsToSheet(
   accessToken: string,
   spreadsheetId: string,
   apiKey: string,
-  preferredModel: string
+  preferredModel: string,
+  feePerNight: number = 50
 ): Promise<void> {
   const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
   const rows = [
     ['GEMINI_API_KEY', apiKey || '', 'Váš Google Gemini API klíč pro automatické OCR rozpoznávání'],
     ['PREFEROVANY_MODEL', preferredModel || 'gemini-flash-latest', 'Aktivní model Gemini'],
+    ['POPLATEK_ZA_NOC', String(feePerNight || 50), 'Sazba poplatku z pobytu v Kč za noc (výchozí 50 Kč)'],
     ['POSLEDNI_AKTUALIZACE', new Date().toISOString(), 'Čas poslední synchronizace']
   ];
 
-  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Nastaveni_API!A2:C4?valueInputOption=USER_ENTERED`, {
+  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Nastaveni!A2:C5?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
     headers,
     body: JSON.stringify({ values: rows })
   });
 }
+
+// Backward-compatible alias
+export const saveApiKeyToSheet = saveSettingsToSheet;
 
 function extractSpreadsheetId(input: string): string {
   const match = input.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);

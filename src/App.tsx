@@ -31,7 +31,8 @@ import {
   ExternalLink,
   Laptop,
   LogOut,
-  User as UserIcon
+  User as UserIcon,
+  KeyRound
 } from 'lucide-react';
 import { Property, Guest, PRAGUE_DISTRICTS, generateCzechIBAN } from './types';
 import { User } from 'firebase/auth';
@@ -48,6 +49,7 @@ import {
   loadAllDataFromGoogleSheet,
   syncAllToGoogleSheet,
   saveApiKeyToSheet,
+  saveSettingsToSheet,
   SpreadsheetInfo
 } from './lib/googleSheets';
 import { runClientGeminiOcr } from './lib/geminiClientOcr';
@@ -95,6 +97,10 @@ export default function App() {
   const [userApiKey, setUserApiKey] = useState<string>(
     safeStorage.getItem('airtax_user_api_key') || ''
   );
+  const [feePerNight, setFeePerNight] = useState<number>(() => {
+    const stored = safeStorage.getItem('airtax_fee_per_night');
+    return stored ? Math.max(1, parseInt(stored) || 50) : 50;
+  });
 
   // Google Workspace & Sheets State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -115,6 +121,7 @@ export default function App() {
   const [editingGuest, setEditingGuest] = useState<Guest | null>(null);
 
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState<boolean>(false);
+  const [isMissingKeyModalOpen, setIsMissingKeyModalOpen] = useState<boolean>(false);
   const [isDataModalOpen, setIsDataModalOpen] = useState<boolean>(false);
   const [isWebcamOpen, setIsWebcamOpen] = useState<boolean>(false);
   const [isDesktopCameraPromptOpen, setIsDesktopCameraPromptOpen] = useState<boolean>(false);
@@ -251,7 +258,7 @@ export default function App() {
       // Read current content from sheet
       const sheetData = await loadAllDataFromGoogleSheet(token, sheet.id);
 
-      // ALWAYS load API key and preferred model from sheet if found!
+      // ALWAYS load API key, preferred model, and fee per night from sheet if found!
       let loadedKey = false;
       if (sheetData.apiKey && sheetData.apiKey.trim().length > 0) {
         const cleanKey = sheetData.apiKey.trim();
@@ -263,6 +270,10 @@ export default function App() {
         const cleanModel = sheetData.preferredModel.trim();
         setActiveModelName(cleanModel);
         safeStorage.setItem('airtax_model_pref', cleanModel);
+      }
+      if (sheetData.feePerNight && sheetData.feePerNight > 0) {
+        setFeePerNight(sheetData.feePerNight);
+        safeStorage.setItem('airtax_fee_per_night', String(sheetData.feePerNight));
       }
 
       // If sheet has properties/guests, update local & server state
@@ -286,14 +297,15 @@ export default function App() {
         }).catch(err => console.warn('Server sync error', err));
 
         const keyMsg = loadedKey ? ' a Gemini API klíč' : '';
-        showToast(`Načteno z Google Sheetu: ${sheetData.properties.length} ubytování, ${sheetData.guests.length} hostů${keyMsg}!`, 'success');
+        showToast(`Načteno z Google Sheetu: ${sheetData.properties.length} ubytování, ${sheetData.guests.length} hostů${keyMsg} (sazba ${sheetData.feePerNight || 50} Kč/noc)!`, 'success');
       } else if (properties.length > 0 || guests.length > 0) {
         // Sheet has no properties/guests yet, push local state to the sheet without wiping API key
         await syncAllToGoogleSheet(token, sheet.id, {
           properties,
           guests,
           apiKey: sheetData.apiKey || userApiKey,
-          preferredModel: sheetData.preferredModel || activeModelName
+          preferredModel: sheetData.preferredModel || activeModelName,
+          feePerNight: sheetData.feePerNight || feePerNight
         });
         const keyMsg = loadedKey ? ' API klíč byl úspěšně načten ze Sheetu.' : '';
         showToast(`Google Sheet inicializován a synchronizován s vašimi daty.${keyMsg}`, 'success');
@@ -342,14 +354,15 @@ export default function App() {
     }
   };
 
-  const syncToSheetIfConnected = async (newProps: Property[], newGuests: Guest[], apiKey?: string, model?: string) => {
+  const syncToSheetIfConnected = async (newProps: Property[], newGuests: Guest[], apiKey?: string, model?: string, fee?: number) => {
     if (googleToken && connectedSheet) {
       try {
         await syncAllToGoogleSheet(googleToken, connectedSheet.id, {
           properties: newProps,
           guests: newGuests,
           apiKey: apiKey ?? userApiKey,
-          preferredModel: model ?? activeModelName
+          preferredModel: model ?? activeModelName,
+          feePerNight: fee ?? feePerNight
         });
       } catch (e: any) {
         console.warn('Google Sheet background sync warning', e);
@@ -384,7 +397,7 @@ export default function App() {
   const totalNights = activeGuests.reduce((sum, g) => sum + g.nights, 0);
   const exemptNights = activeGuests.reduce((sum, g) => sum + (g.exemption !== 'none' ? g.nights : 0), 0);
   const chargeableNights = totalNights - exemptNights;
-  const totalFee = chargeableNights * 50;
+  const totalFee = chargeableNights * feePerNight;
 
   // Update SPAYD QR code whenever active property, guests, or message changes
   useEffect(() => {
@@ -592,7 +605,7 @@ export default function App() {
       const gId = editingGuest?.id || `g_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const nights = Math.max(1, guestForm.nights || 1);
       const isExempt = guestForm.exemption !== 'none';
-      const fee = isExempt ? 0 : nights * 50;
+      const fee = isExempt ? 0 : nights * feePerNight;
       const guestObj: Guest = {
         id: gId,
         propertyId: activeProperty.id,
@@ -695,8 +708,18 @@ export default function App() {
     });
   };
 
-  // Trigger Camera / Photo Picker (On-Demand only)
+  // Check if Gemini API key is available before triggering photo / file picker
+  const checkApiKeyOrPrompt = (): boolean => {
+    if (userApiKey && userApiKey.trim().length > 0) {
+      return true;
+    }
+    setIsMissingKeyModalOpen(true);
+    return false;
+  };
+
+  // Trigger Camera / Photo Picker (On-Demand only, verified API key)
   const handleTakePhotoClick = () => {
+    if (!checkApiKeyOrPrompt()) return;
     const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
       (navigator.maxTouchPoints > 1 && !window.matchMedia('(pointer: fine)').matches);
 
@@ -709,7 +732,13 @@ export default function App() {
     }
   };
 
+  const handlePickFromGalleryClick = () => {
+    if (!checkApiKeyOrPrompt()) return;
+    galleryInputRef.current?.click();
+  };
+
   const startWebcam = async () => {
+    if (!checkApiKeyOrPrompt()) return;
     setIsWebcamOpen(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -753,6 +782,11 @@ export default function App() {
   const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (!userApiKey || userApiKey.trim().length === 0) {
+      setIsMissingKeyModalOpen(true);
+      e.target.value = '';
+      return;
+    }
     try {
       const compressedDataUrl = await compressImage(file, 1600, 0.85);
       processImageForOCR(compressedDataUrl);
@@ -778,6 +812,7 @@ export default function App() {
     dropZoneRef.current?.classList.remove('border-rose-500', 'bg-rose-950/20');
     const file = e.dataTransfer.files?.[0];
     if (file && file.type.startsWith('image/')) {
+      if (!checkApiKeyOrPrompt()) return;
       const dataUrl = await compressImage(file, 1600, 0.85);
       processImageForOCR(dataUrl);
     } else {
@@ -817,7 +852,7 @@ export default function App() {
         dateDeparture: g.dateDeparture || '',
         nights,
         exemption: g.exemption || 'none',
-        fee: isExempt ? 0 : nights * 50,
+        fee: isExempt ? 0 : nights * feePerNight,
         createdAt: new Date().toISOString()
       };
     });
@@ -884,7 +919,7 @@ export default function App() {
       // 2. Fallback to client-side Gemini OCR (e.g. on GitHub Pages)
       if (!data) {
         if (!userApiKey) {
-          throw new Error('Pro OCR skenování na GitHub Pages zadejte Gemini API klíč v Nastavení nebo se připojte ke svému Google Sešitu (list Nastaveni_API).');
+          throw new Error('Pro OCR skenování na GitHub Pages zadejte Gemini API klíč v Nastavení nebo se připojte ke svému Google Sešitu (list Nastaveni).');
         }
         setScanStatus(`Čtu formulář v prohlížeči (${activeModelName})...`);
         const clientRes = await runClientGeminiOcr(
@@ -1085,20 +1120,28 @@ export default function App() {
     }
   };
 
-  // Save Settings & API key
+  // Save Settings, API key & Fee rate
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     safeStorage.setItem('airtax_user_api_key', userApiKey);
     safeStorage.setItem('airtax_model_pref', activeModelName);
+    safeStorage.setItem('airtax_fee_per_night', String(feePerNight));
     if (googleToken && connectedSheet) {
       try {
-        await saveApiKeyToSheet(googleToken, connectedSheet.id, userApiKey, activeModelName);
-        showToast('Nastavení a API klíč uloženy do Google Sheetu!', 'success');
+        await saveSettingsToSheet(googleToken, connectedSheet.id, userApiKey, activeModelName, feePerNight);
+        await syncAllToGoogleSheet(googleToken, connectedSheet.id, {
+          properties,
+          guests,
+          apiKey: userApiKey,
+          preferredModel: activeModelName,
+          feePerNight
+        });
+        showToast(`Nastavení, API klíč a sazba (${feePerNight} Kč/noc) uloženy do Google Sheetu!`, 'success');
       } catch (err: any) {
         showToast('Klíč uložen lokálně, zápis do Sheetu selhal: ' + err.message, 'warning');
       }
     } else {
-      showToast('Nastavení OCR uloženo!', 'success');
+      showToast(`Nastavení uloženo (sazba ${feePerNight} Kč/noc)!`, 'success');
     }
     setIsSettingsModalOpen(false);
   };
@@ -1145,7 +1188,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
       `"${g.dateDeparture.replace(/"/g, '""')}"`,
       g.nights,
       `"${g.exemption}"`,
-      g.exemption !== 'none' ? 0 : 50,
+      g.exemption !== 'none' ? 0 : feePerNight,
       g.fee
     ]);
 
@@ -1263,32 +1306,30 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
     <div className="flex flex-col h-full bg-[#0A0E17] text-slate-100 font-sans selection:bg-rose-500 selection:text-white">
 
       {/* TOP HEADER */}
-      <header className="sticky top-0 z-40 bg-[#0D131F] border-b border-slate-800/90 px-4 pt-[calc(0.75rem+env(safe-area-inset-top,0px))] pb-3 shadow-md select-none">
-        <div className="max-w-2xl mx-auto flex items-center justify-between">
-          <div className="flex items-center space-x-2.5">
-            <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-[#FF385C] to-rose-600 flex items-center justify-center shadow-md shadow-rose-600/30 shrink-0">
-              <Scan className="w-4 h-4 text-white" />
+      <header className="sticky top-0 z-40 bg-[#0D131F] border-b border-slate-800/90 px-3 sm:px-4 pt-[calc(0.65rem+env(safe-area-inset-top,0px))] pb-2.5 sm:pb-3 shadow-md select-none">
+        <div className="max-w-2xl mx-auto flex items-center justify-between gap-2">
+          {/* Brand & Status (Red icon removed, optimized for iPhone 12 width) */}
+          <div className="flex flex-col justify-center min-w-0 pr-1">
+            <div className="flex items-center gap-1.5 leading-none">
+              <h1 className="text-sm font-bold tracking-tight text-white whitespace-nowrap">AirTax Praha</h1>
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 font-bold border border-rose-500/30 whitespace-nowrap">
+                {feePerNight} Kč/noc
+              </span>
             </div>
-            <div>
-              <div className="flex items-center gap-1.5 leading-none">
-                <h1 className="text-sm font-bold tracking-tight text-white">AirTax Praha</h1>
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 font-bold border border-rose-500/30">
-                  50 Kč/noc
-                </span>
-              </div>
-              <div className="flex items-center gap-1.5 mt-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                <span className="text-[10px] text-slate-400 font-medium">Cloud Sync aktivní</span>
-                <span className="text-[10px] text-slate-600">•</span>
-                <span className="text-[10px] text-emerald-400 font-mono font-semibold">{activeModelName}</span>
-              </div>
+            <div className="flex items-center gap-1.5 mt-1 text-[10px] text-slate-400 leading-tight">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0"></span>
+              <span className="hidden sm:inline font-medium">Cloud Sync aktivní</span>
+              <span className="sm:hidden font-medium">Sync</span>
+              <span className="text-slate-600">•</span>
+              <span className="text-emerald-400 font-mono font-medium truncate max-w-[95px] sm:max-w-[160px]">{activeModelName}</span>
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5">
+          {/* Action buttons (Správa ubytování removed, compact for iPhone 12) */}
+          <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
             {/* Google Sheets Status / Connect Button */}
             {currentUser && connectedSheet ? (
-              <div className="flex items-center gap-1.5 bg-emerald-950/60 border border-emerald-500/40 rounded-xl px-2.5 py-1.5 shadow-sm">
+              <div className="flex items-center gap-1 bg-emerald-950/60 border border-emerald-500/40 rounded-xl px-2 py-1 sm:px-2.5 sm:py-1.5 shadow-sm">
                 <a
                   href={connectedSheet.url}
                   target="_blank"
@@ -1297,8 +1338,8 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   title="Otevřít propojený Google Sheet"
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span className="hidden sm:inline">Sheet</span>
-                  <ExternalLink className="w-2.5 h-2.5 opacity-75 shrink-0" />
+                  <span>Sheet</span>
+                  <ExternalLink className="w-2.5 h-2.5 opacity-75 shrink-0 hidden xs:inline" />
                 </a>
                 <button
                   onClick={() => autoConnectSheet(googleToken!)}
@@ -1313,7 +1354,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
               <button
                 onClick={handleGoogleLoginClick}
                 disabled={isGoogleLoading}
-                className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold tap-active cursor-pointer shadow-sm transition-all"
+                className="flex items-center gap-1 px-2 py-1.5 sm:px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold tap-active cursor-pointer shadow-sm transition-all"
                 title="Připojit Google Sheet pro automatické ukládání dat a API klíče"
               >
                 <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
@@ -1324,24 +1365,17 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
 
             <button
               onClick={() => setIsDataModalOpen(true)}
-              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-slate-200 tap-active cursor-pointer shadow-sm transition-all"
+              className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-slate-200 tap-active cursor-pointer shadow-sm transition-all shrink-0"
               title="Export & Import dat"
             >
               <Download className="w-4 h-4 text-emerald-400" />
             </button>
             <button
               onClick={() => setIsSettingsModalOpen(true)}
-              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-amber-300 tap-active cursor-pointer shadow-sm transition-all"
-              title="Nastavení OCR, Google Sheet & Klíče"
+              className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-amber-300 tap-active cursor-pointer shadow-sm transition-all shrink-0"
+              title="Nastavení OCR, Sazba poplatku & Klíče"
             >
               <Sliders className="w-4 h-4 text-amber-400" />
-            </button>
-            <button
-              onClick={() => { setPropModalMode('list'); setIsPropModalOpen(true); }}
-              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700/80 flex items-center justify-center text-slate-200 tap-active cursor-pointer shadow-sm transition-all"
-              title="Správa ubytovacích míst"
-            >
-              <Building className="w-4 h-4 text-rose-400" />
             </button>
           </div>
         </div>
@@ -1490,7 +1524,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
 
                 <button
                   type="button"
-                  onClick={() => galleryInputRef.current?.click()}
+                  onClick={handlePickFromGalleryClick}
                   className="py-2.5 px-3 bg-slate-800/80 hover:bg-slate-750 border border-slate-700 rounded-xl text-xs font-medium text-slate-300 flex items-center justify-center gap-1.5 tap-active cursor-pointer"
                 >
                   <ImageIcon className="w-4 h-4 text-rose-400" />
@@ -1536,7 +1570,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   </div>
                 )}
                 <p className="text-[11px] text-slate-400 italic text-center">
-                  Gemini čte jméno, pas, data pobytu a počítá poplatek 50 Kč/noc.
+                  Gemini čte jméno, pas, data pobytu a počítá poplatek {feePerNight} Kč/noc.
                 </p>
               </div>
             )}
@@ -1562,7 +1596,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   <p className="text-base font-bold text-emerald-300 mt-0.5">{exemptNights} nocí</p>
                 </div>
                 <div className="bg-rose-950/40 border border-rose-800/40 rounded-xl p-2.5">
-                  <p className="text-[10px] text-rose-300">K úhradě (50 Kč)</p>
+                  <p className="text-[10px] text-rose-300">K úhradě ({feePerNight} Kč)</p>
                   <p className="text-base font-black text-rose-400 mt-0.5">{totalFee.toLocaleString('cs-CZ')} Kč</p>
                 </div>
               </div>
@@ -1700,7 +1734,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                             </span>
                           ) : (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">
-                              Poplatek: {g.fee} Kč ({g.nights} × 50 Kč)
+                              Poplatek: {g.fee} Kč ({g.nights} × {feePerNight} Kč)
                             </span>
                           )}
                           <span className="text-[10px] text-slate-500 truncate max-w-[160px]">
@@ -1852,10 +1886,10 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
             <div className="space-y-2 border-b border-slate-800 pb-3">
               <h3 className="text-xs font-bold text-rose-400 flex items-center gap-1.5">
                 <Info className="w-3.5 h-3.5" />
-                Sazba poplatku hl. m. Prahy (50 Kč/noc)
+                Sazba poplatku hl. m. Prahy ({feePerNight} Kč/noc)
               </h3>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Místní poplatek z pobytu v hl. m. Praze činí <strong>50 Kč za každý započatý den pobytu</strong> (den příjezdu se dle zákona nepočítá). Osoby mladší 18 let jsou ze zákona č. 565/1990 Sb. osvobozeny (poplatek 0 Kč).
+                Místní poplatek z pobytu činí aktuálně <strong>{feePerNight} Kč za každý započatý den pobytu</strong> (den příjezdu se dle zákona nepočítá). Sazbu lze libovolně konfigurovat v Nastavení a ukládá se do Google Sheetu. Osoby mladší 18 let jsou ze zákona č. 565/1990 Sb. osvobozeny (poplatek 0 Kč).
               </p>
             </div>
 
@@ -2271,7 +2305,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                 <div className="text-right">
                   <span className="block text-[11px] text-slate-400">Poplatek</span>
                   <span className="text-base font-black text-rose-400">
-                    {guestForm.exemption !== 'none' ? '0 Kč (Osvobozen)' : `${guestForm.nights * 50} Kč`}
+                    {guestForm.exemption !== 'none' ? '0 Kč (Osvobozen)' : `${guestForm.nights * feePerNight} Kč`}
                   </span>
                 </div>
               </div>
@@ -2283,7 +2317,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   onChange={e => setGuestForm(prev => ({ ...prev, exemption: e.target.value as any }))}
                   className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white outline-none"
                 >
-                  <option value="none">Ne – Plátce (50 Kč / noc)</option>
+                  <option value="none">Ne – Plátce ({feePerNight} Kč / noc)</option>
                   <option value="under18">Osoba mladší 18 let (Osvobozeno)</option>
                   <option value="ztp">Držitel průkazu ZTP/P (Osvobozeno)</option>
                   <option value="other">Jiný zákonný důvod (§ 3b)</option>
@@ -2362,7 +2396,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                         </a>
                       </div>
                       <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
-                        Data se automaticky ukládají do 4 listů: <strong>Ubytovani</strong>, <strong>Hoste</strong>, <strong>Prehled_odvodu</strong> a <strong>Nastaveni_API</strong>.
+                        Data se automaticky ukládají do 4 listů: <strong>Ubytovani</strong>, <strong>Hoste</strong>, <strong>Prehled_odvodu</strong> a <strong>Nastaveni</strong>.
                       </p>
                     </div>
 
@@ -2434,6 +2468,27 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                 </div>
               </div>
 
+              {/* FEE PER NIGHT CONFIGURATION */}
+              <div>
+                <label className="block font-bold text-slate-300 mb-1">
+                  Sazba poplatku z pobytu (Kč / noc):
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min="1"
+                    max="1000"
+                    value={feePerNight}
+                    onChange={e => setFeePerNight(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="w-28 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white font-bold text-sm outline-none focus:ring-1 focus:ring-amber-500"
+                  />
+                  <span className="text-xs text-slate-300 font-semibold">Kč za noc</span>
+                </div>
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Výchozí zákonná sazba v hl. m. Praze je 50 Kč. Hodnota se ukládá do Google Sheetu (list <strong>Nastaveni</strong>, parametr <code>POPLATEK_ZA_NOC</code>).
+                </p>
+              </div>
+
               <div>
                 <label className="block font-bold text-slate-300 mb-1">Model Gemini OCR:</label>
                 <select
@@ -2446,13 +2501,13 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Nejlevnější verze)</option>
                 </select>
                 <p className="text-[10px] text-slate-400 mt-1">
-                  Při uložení se zvolený model propíše i do listu <strong>Nastaveni_API</strong> ve vašem Google Sheetu.
+                  Při uložení se zvolený model propíše i do listu <strong>Nastaveni</strong> ve vašem Google Sheetu.
                 </p>
               </div>
 
               <div>
                 <label className="block font-bold text-slate-300 mb-1">
-                  Gemini API Klíč (ukládá se do Google Sheetu 'Nastaveni_API'):
+                  Gemini API Klíč (ukládá se do Google Sheetu 'Nastaveni'):
                 </label>
                 <input
                   type="password"
@@ -2462,7 +2517,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-white font-mono text-xs outline-none focus:ring-1 focus:ring-amber-500"
                 />
                 <p className="text-[10px] text-slate-400 mt-1">
-                  Klíč se bezpečně ukládá na samostatném listu <strong>Nastaveni_API</strong> ve vašem soukromém Google Sešitu a je automaticky dostupný na všech vašich zařízeních (iPhone, Android, PC, Google Sites).
+                  Klíč se bezpečně ukládá na samostatném listu <strong>Nastaveni</strong> ve vašem soukromém Google Sešitu a je automaticky dostupný na všech vašich zařízeních (iPhone, Android, PC, Google Sites).
                 </p>
               </div>
 
@@ -2471,7 +2526,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   type="submit"
                   className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold shadow-lg shadow-amber-500/20 tap-active cursor-pointer"
                 >
-                  Uložit nastavení & synchronizovat API list
+                  Uložit nastavení & synchronizovat list Nastaveni
                 </button>
 
                 <div className="pt-3 border-t border-slate-800">
@@ -2489,6 +2544,98 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                 </div>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MISSING GEMINI API KEY MODAL */}
+      {isMissingKeyModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="bg-[#0D131F] border border-slate-800 rounded-t-3xl sm:rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0">
+                  <KeyRound className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Chybí Google Gemini API klíč</h3>
+                  <p className="text-[11px] text-slate-400">Nutný pro automatické čtení údajů z lístku</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsMissingKeyModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center tap-active"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="bg-slate-900/80 rounded-xl p-3.5 border border-slate-800 text-xs text-slate-300 space-y-2 leading-relaxed">
+              <p>
+                Pro automatické rozpoznávání údajů (jméno, pas, data pobytu a výpočet poplatku) je vyžadován Google Gemini API klíč.
+              </p>
+              {connectedSheet ? (
+                <div className="text-emerald-400 text-[11px] bg-emerald-950/40 p-2.5 rounded-lg border border-emerald-500/30">
+                  Váš Google Sheet je připojen. Pokud máte klíč zadaný v listu <strong>Nastaveni</strong>, stačí klepnout na tlačítko níže pro jeho načtení.
+                </div>
+              ) : (
+                <div className="text-slate-400 text-[11px]">
+                  Klíč můžete zadat přímo do listu <strong>Nastaveni</strong> ve vašem Google Sheetu nebo jej vložit ručně v Nastavení aplikace.
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-2 pt-1">
+              {connectedSheet && googleToken ? (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setIsMissingKeyModalOpen(false);
+                    await autoConnectSheet(googleToken);
+                  }}
+                  className="w-full py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2 tap-active cursor-pointer"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  <span>Znovu načíst klíč ze Sešitu</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setIsMissingKeyModalOpen(false);
+                    await handleGoogleLoginClick();
+                  }}
+                  className="w-full py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2 tap-active cursor-pointer"
+                >
+                  <FileSpreadsheet className="w-4 h-4" />
+                  <span>Připojit Google Sheet s listem Nastaveni</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  setIsMissingKeyModalOpen(false);
+                  setIsSettingsModalOpen(true);
+                }}
+                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300 font-bold text-xs flex items-center justify-center gap-2 tap-active cursor-pointer"
+              >
+                <Sliders className="w-4 h-4 text-amber-400" />
+                <span>Zadat API klíč ručně v Nastavení</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setIsMissingKeyModalOpen(false);
+                  openNewGuestModal();
+                }}
+                className="w-full py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-400 text-xs font-semibold flex items-center justify-center gap-1.5 tap-active"
+              >
+                <Edit3 className="w-3.5 h-3.5" />
+                <span>Přeskočit k ručnímu zápisu hosta</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
