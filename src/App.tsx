@@ -130,6 +130,8 @@ export default function App() {
 
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState<boolean>(false);
   const [isMissingKeyModalOpen, setIsMissingKeyModalOpen] = useState<boolean>(false);
+  const [isFeeModalOpen, setIsFeeModalOpen] = useState<boolean>(false);
+  const [tempFeeInput, setTempFeeInput] = useState<number>(50);
   const [isModelSelectorOpen, setIsModelSelectorOpen] = useState<boolean>(false);
   const [availableModels, setAvailableModels] = useState<GeminiModelInfo[]>(CURATED_OCR_MODELS);
   const [isLoadingModels, setIsLoadingModels] = useState<boolean>(false);
@@ -769,6 +771,40 @@ export default function App() {
     }
   };
 
+  // User modified fee per night: save locally and write to Google Sheet in tab Nastaveni
+  const handleSaveFee = async (newFee: number) => {
+    const validFee = Math.max(1, newFee || 50);
+    setFeePerNight(validFee);
+    safeStorage.setItem('airtax_fee_per_night', String(validFee));
+    setIsFeeModalOpen(false);
+
+    // Update fee calculation for existing guests
+    const updatedGuests = guests.map(g => ({
+      ...g,
+      fee: g.exemption && g.exemption !== 'none' ? 0 : g.nights * validFee
+    }));
+    setGuests(updatedGuests);
+    persistLocalState(properties, updatedGuests);
+
+    if (connectedSheet && googleToken) {
+      try {
+        await saveSettingsToSheet(googleToken, connectedSheet.id, userApiKey, activeModelName, validFee);
+        await syncAllToGoogleSheet(googleToken, connectedSheet.id, {
+          properties,
+          guests: updatedGuests,
+          apiKey: userApiKey,
+          preferredModel: activeModelName,
+          feePerNight: validFee
+        });
+        showToast(`Sazba nastavena na ${validFee} Kč/noc a uložena do Sešitu.`, 'success');
+      } catch (err: any) {
+        showToast(`Sazba uložena lokálně (${err.message})`, 'warning');
+      }
+    } else {
+      showToast(`Sazba nastavena na ${validFee} Kč/noc.`, 'success');
+    }
+  };
+
   // Trigger Camera / Photo Picker (On-Demand only, verified API key)
   const handleTakePhotoClick = () => {
     if (!checkApiKeyOrPrompt()) return;
@@ -1358,20 +1394,29 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
     <div className="flex flex-col h-full bg-[#0A0E17] text-slate-100 font-sans selection:bg-rose-500 selection:text-white">
 
       {/* TOP HEADER */}
-      <header className="header-sharp sticky top-0 z-40 bg-[#0D131F] border-b border-slate-800 px-3 sm:px-4 pt-[max(12px,env(safe-area-inset-top,12px))] pb-2.5 sm:pb-3 shadow-md">
+      <header className="header-sharp sticky top-0 z-40 bg-[#0D131F] border-b border-slate-800 px-3 sm:px-4 pb-2.5 sm:pb-3 shadow-md">
         <div className="max-w-2xl mx-auto flex items-center justify-between gap-2">
-          {/* Brand & Status (AirTax v1.0.0, sharp typography, clickable model selector) */}
+          {/* Brand & Status (AirTax v1.0.0, sharp typography, clickable fee & model) */}
           <div className="flex flex-col justify-center min-w-0 pr-1">
             <div className="flex items-center gap-1.5 leading-none">
               <h1 className="text-base font-extrabold tracking-tight text-white whitespace-nowrap">AirTax</h1>
               <span className="text-[10px] font-mono font-semibold px-1 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/60 leading-none">
                 v{APP_VERSION}
               </span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 font-bold border border-rose-500/30 whitespace-nowrap leading-none">
-                {feePerNight} Kč/noc
-              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setTempFeeInput(feePerNight);
+                  setIsFeeModalOpen(true);
+                }}
+                className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 hover:bg-rose-500/25 active:scale-95 text-rose-400 hover:text-rose-300 font-bold border border-rose-500/30 whitespace-nowrap leading-none tap-active cursor-pointer flex items-center gap-0.5"
+                title="Klikněte pro změnu sazby poplatku z pobytu"
+              >
+                <span>{feePerNight} Kč/noc</span>
+                <ChevronDown className="w-2.5 h-2.5 opacity-80" />
+              </button>
             </div>
-            <div className="flex items-center gap-1.5 mt-1 text-[11px] text-slate-400 leading-tight">
+            <div className="flex items-center gap-1.5 mt-1 text-[11px] leading-tight">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
               <button
                 type="button"
@@ -1379,7 +1424,6 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                 className="flex items-center gap-1 text-emerald-400 hover:text-emerald-300 font-mono font-semibold truncate max-w-[150px] sm:max-w-[220px] tap-active cursor-pointer group"
                 title="Klikněte pro výběr a konfiguraci modelu Gemini"
               >
-                <span className="text-slate-400 font-sans font-normal text-[10px]">Model:</span>
                 <span className="truncate underline decoration-emerald-500/40 underline-offset-2">{activeModelName}</span>
                 <ChevronDown className="w-3 h-3 shrink-0 text-emerald-400/80 group-hover:text-emerald-300" />
               </button>
@@ -1546,7 +1590,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
               className="relative overflow-hidden rounded-3xl bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-800 p-5 shadow-xl transition-all"
             >
               <div className="text-center space-y-1.5 mb-4">
-                <h2 className="text-base font-bold text-white">Naskenovat Registration Form</h2>
+                <h2 className="text-base font-bold text-white">Naskenovat Registrační formulář</h2>
                 <p className="text-xs text-slate-400">
                   Vyfoťte ubytovací lístek fotoaparátem nebo jej sem přetáhněte. Termín se automaticky přiřadí všem osobám na lístku.
                 </p>
@@ -2692,6 +2736,111 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                 <Edit3 className="w-3.5 h-3.5" />
                 <span>Přeskočit k ručnímu zápisu hosta</span>
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FEE CONFIGURATION MODAL */}
+      {isFeeModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="bg-[#0D131F] border border-slate-800 rounded-t-3xl sm:rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-400 flex items-center justify-center shrink-0">
+                  <Building className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Sazba poplatku z pobytu</h3>
+                  <p className="text-[11px] text-slate-400">Nastavení částky za osobu a noc</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsFeeModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center tap-active"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                  Rychlá volba sazby:
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[50, 40, 30].map(amount => (
+                    <button
+                      key={amount}
+                      type="button"
+                      onClick={() => setTempFeeInput(amount)}
+                      className={`py-2 px-3 rounded-xl border text-xs font-bold transition-all tap-active cursor-pointer ${
+                        tempFeeInput === amount
+                          ? 'bg-rose-500/20 border-rose-500 text-rose-300 shadow-sm'
+                          : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      {amount} Kč/noc
+                      {amount === 50 && <span className="block text-[9px] font-normal text-rose-400/80">Vyhláška Praha</span>}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                  Vlastní částka (Kč za noc):
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min="1"
+                    max="1000"
+                    value={tempFeeInput || ''}
+                    onChange={e => setTempFeeInput(Math.max(1, parseInt(e.target.value) || 0))}
+                    className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm font-bold text-white focus:outline-none focus:border-rose-500"
+                    placeholder="50"
+                  />
+                  <span className="text-xs font-bold text-slate-400 shrink-0">Kč / noc</span>
+                </div>
+              </div>
+
+              <div className="bg-slate-900/70 rounded-xl p-3 border border-slate-800/80 text-[11px] text-slate-400 leading-relaxed">
+                Aktuální zákonná vyhláška hl. m. Prahy stanovuje místní poplatek na <strong>50 Kč za den pobytu</strong>. Osoby mladší 18 let jsou ze zákona osvobozeny.
+              </div>
+            </div>
+
+            <div className="space-y-2 pt-2">
+              <button
+                type="button"
+                onClick={() => handleSaveFee(tempFeeInput)}
+                className="w-full py-2.5 rounded-xl bg-gradient-to-r from-[#FF385C] to-rose-600 hover:from-rose-600 hover:to-rose-700 text-white font-bold text-xs shadow-lg shadow-rose-600/30 flex items-center justify-center gap-2 tap-active cursor-pointer"
+              >
+                <Check className="w-4 h-4 stroke-[3]" />
+                <span>Uložit sazbu ({tempFeeInput} Kč/noc)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsFeeModalOpen(false)}
+                className="w-full py-2 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-300 text-xs font-semibold tap-active cursor-pointer"
+              >
+                Zavřít
+              </button>
+            </div>
+
+            {/* Footer info about saving */}
+            <div className="pt-2 border-t border-slate-800 text-[11px] text-slate-400 flex items-center justify-between shrink-0">
+              <div>
+                {connectedSheet ? (
+                  <span className="text-emerald-400 flex items-center gap-1 font-medium">
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>Ukládá se do listu Nastaveni</span>
+                  </span>
+                ) : (
+                  <span>Ukládá se do paměti aplikace</span>
+                )}
+              </div>
             </div>
           </div>
         </div>

@@ -27,6 +27,14 @@
   filter: none !important;
   -webkit-backdrop-filter: none !important;
   backdrop-filter: none !important;
+  padding-top: calc(env(safe-area-inset-top, 0px) + 14px) !important;
+}
+
+@supports (-webkit-touch-callout: none) {
+  /* iOS Safari / WebKit standalone PWA safe notch clearance (iPhone 12 Pro status bar is 47px) */
+  .header-sharp {
+    padding-top: max(56px, calc(env(safe-area-inset-top, 47px) + 12px)) !important;
+  }
 }
 
 /* Custom scrollbars that hide scrollbar yet keep scrolling smooth */
