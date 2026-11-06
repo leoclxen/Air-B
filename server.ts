@@ -42,6 +42,7 @@ export interface Property {
   address: string;
   districtKey: string;
   variableSymbol: string;
+  feePerNight?: number;
 }
 
 export interface Guest {
@@ -148,7 +149,7 @@ app.get('/api/data', (_req, res) => {
 // 2. Add or update property
 app.post('/api/properties', (req, res) => {
   const data = loadData();
-  const { id, name, hostName, address, districtKey, variableSymbol } = req.body;
+  const { id, name, hostName, address, districtKey, variableSymbol, feePerNight } = req.body;
 
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'Název ubytování je povinný' });
@@ -163,7 +164,8 @@ app.post('/api/properties', (req, res) => {
     hostName: (hostName || '').trim(),
     address: (address || '').trim(),
     districtKey: districtKey || 'praha8',
-    variableSymbol: (variableSymbol || '').trim()
+    variableSymbol: (variableSymbol || '').trim(),
+    feePerNight: feePerNight ? Number(feePerNight) : undefined
   };
 
   if (existingIdx >= 0) {
@@ -276,7 +278,8 @@ app.post('/api/batch-guests', (req, res) => {
         hostName: property.hostName || '',
         address: property.address || '',
         districtKey: property.districtKey || 'praha8',
-        variableSymbol: property.variableSymbol || ''
+        variableSymbol: property.variableSymbol || '',
+        feePerNight: property.feePerNight ? Number(property.feePerNight) : undefined
       };
       data.properties.push(newProp);
       if (!data.meta.activePropertyId) {
@@ -285,11 +288,14 @@ app.post('/api/batch-guests', (req, res) => {
     }
   }
 
+  const effectiveProp = data.properties.find(p => p.id === propId);
+  const propFee = effectiveProp?.feePerNight || 50;
+
   if (Array.isArray(incomingGuests)) {
     incomingGuests.forEach((g: any) => {
       const nights = Math.max(1, parseInt(g.nights) || 1);
       const isExempt = g.exemption && g.exemption !== 'none';
-      const fee = isExempt ? 0 : nights * 50;
+      const fee = isExempt ? 0 : nights * propFee;
 
       data.guests.unshift({
         id: g.id || `g_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,

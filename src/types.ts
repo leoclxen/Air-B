@@ -5,6 +5,7 @@ export interface Property {
   address: string;
   districtKey: string;
   variableSymbol: string;
+  feePerNight?: number;
 }
 
 export interface Guest {

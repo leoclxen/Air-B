@@ -31,9 +31,15 @@
 }
 
 @supports (-webkit-touch-callout: none) {
-  /* iOS Safari / WebKit standalone PWA safe notch clearance (iPhone 12 Pro status bar is 47px) */
+  /* iOS Safari / WebKit standalone PWA safe notch clearance (notch calculated at 57px) */
   .header-sharp {
-    padding-top: max(56px, calc(env(safe-area-inset-top, 47px) + 12px)) !important;
+    padding-top: max(71px, calc(env(safe-area-inset-top, 57px) + 14px)) !important;
+  }
+}
+
+@media (display-mode: standalone) {
+  .header-sharp {
+    padding-top: max(71px, calc(env(safe-area-inset-top, 57px) + 14px)) !important;
   }
 }
 

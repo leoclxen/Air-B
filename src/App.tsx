@@ -155,7 +155,8 @@ export default function App() {
     hostName: '',
     address: '',
     districtKey: 'praha8',
-    variableSymbol: ''
+    variableSymbol: '',
+    feePerNight: 50
   });
 
   // QR Code State
@@ -179,7 +180,8 @@ export default function App() {
     hostName: '',
     address: '',
     districtKey: 'praha8',
-    variableSymbol: ''
+    variableSymbol: '',
+    feePerNight: 50
   });
 
   // Guest form state
@@ -462,7 +464,8 @@ export default function App() {
       hostName: '',
       address: '',
       districtKey: 'praha8',
-      variableSymbol: ''
+      variableSymbol: '',
+      feePerNight: feePerNight
     });
     setEditingPropId(null);
     setPropModalMode('form');
@@ -475,7 +478,8 @@ export default function App() {
       hostName: prop.hostName || '',
       address: prop.address || '',
       districtKey: prop.districtKey || 'praha8',
-      variableSymbol: prop.variableSymbol || ''
+      variableSymbol: prop.variableSymbol || '',
+      feePerNight: prop.feePerNight || feePerNight
     });
     setEditingPropId(prop.id);
     setPropModalMode('form');
@@ -495,7 +499,8 @@ export default function App() {
       const existingIdx = newProps.findIndex(p => p.id === propId);
       const updatedProp: Property = {
         id: propId,
-        ...propForm
+        ...propForm,
+        feePerNight: Math.max(1, parseInt(String(propForm.feePerNight)) || feePerNight)
       };
       if (existingIdx >= 0) {
         newProps[existingIdx] = updatedProp;
@@ -619,8 +624,9 @@ export default function App() {
     try {
       const gId = editingGuest?.id || `g_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const nights = Math.max(1, guestForm.nights || 1);
-      const isExempt = guestForm.exemption !== 'none';
-      const fee = isExempt ? 0 : nights * feePerNight;
+      const isExempt = guestForm.exemption && guestForm.exemption !== 'none';
+      const propFee = activeProperty.feePerNight || feePerNight;
+      const fee = isExempt ? 0 : nights * propFee;
       const guestObj: Guest = {
         id: gId,
         propertyId: activeProperty.id,
@@ -778,19 +784,31 @@ export default function App() {
     safeStorage.setItem('airtax_fee_per_night', String(validFee));
     setIsFeeModalOpen(false);
 
-    // Update fee calculation for existing guests
-    const updatedGuests = guests.map(g => ({
-      ...g,
-      fee: g.exemption && g.exemption !== 'none' ? 0 : g.nights * validFee
-    }));
+    let updatedProps = [...properties];
+    if (activePropertyId) {
+      updatedProps = updatedProps.map(p =>
+        p.id === activePropertyId ? { ...p, feePerNight: validFee } : p
+      );
+      setProperties(updatedProps);
+    }
+
+    // Update fee calculation for existing guests using their property fee
+    const updatedGuests = guests.map(g => {
+      const parentP = updatedProps.find(p => p.id === g.propertyId);
+      const effectiveFee = parentP?.feePerNight || validFee;
+      return {
+        ...g,
+        fee: g.exemption && g.exemption !== 'none' ? 0 : g.nights * effectiveFee
+      };
+    });
     setGuests(updatedGuests);
-    persistLocalState(properties, updatedGuests);
+    persistLocalState(updatedProps, updatedGuests);
 
     if (connectedSheet && googleToken) {
       try {
         await saveSettingsToSheet(googleToken, connectedSheet.id, userApiKey, activeModelName, validFee);
         await syncAllToGoogleSheet(googleToken, connectedSheet.id, {
-          properties,
+          properties: updatedProps,
           guests: updatedGuests,
           apiKey: userApiKey,
           preferredModel: activeModelName,
@@ -918,6 +936,7 @@ export default function App() {
       updatedProps.push(targetProp);
     }
 
+    const propEffectiveFee = targetProp.feePerNight || feePerNight;
     const formattedGuests: Guest[] = newGuestList.map((g: any) => {
       const nights = Math.max(1, parseInt(g.nights) || 1);
       const isExempt = g.exemption && g.exemption !== 'none';
@@ -940,7 +959,7 @@ export default function App() {
         dateDeparture: g.dateDeparture || '',
         nights,
         exemption: g.exemption || 'none',
-        fee: isExempt ? 0 : nights * feePerNight,
+        fee: isExempt ? 0 : nights * propEffectiveFee,
         createdAt: new Date().toISOString()
       };
     });
@@ -1095,7 +1114,8 @@ export default function App() {
           hostName: data.detectedHostName || '',
           address: data.detectedAddress || 'Praha',
           districtKey: detectedDistrict,
-          variableSymbol: data.detectedVS || ''
+          variableSymbol: data.detectedVS || '',
+          feePerNight: feePerNight
         });
         setIsScanConfirmModalOpen(true);
       }
@@ -1176,7 +1196,8 @@ export default function App() {
           hostName: scanNewPropForm.hostName.trim(),
           address: scanNewPropForm.address.trim(),
           districtKey: scanNewPropForm.districtKey,
-          variableSymbol: scanNewPropForm.variableSymbol.trim()
+          variableSymbol: scanNewPropForm.variableSymbol.trim(),
+          feePerNight: feePerNight
         };
       }
 
@@ -1406,13 +1427,13 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
               <button
                 type="button"
                 onClick={() => {
-                  setTempFeeInput(feePerNight);
+                  setTempFeeInput(activeProperty?.feePerNight || feePerNight);
                   setIsFeeModalOpen(true);
                 }}
                 className="text-[10px] px-1.5 py-0.5 rounded-full bg-rose-500/15 hover:bg-rose-500/25 active:scale-95 text-rose-400 hover:text-rose-300 font-bold border border-rose-500/30 whitespace-nowrap leading-none tap-active cursor-pointer flex items-center gap-0.5"
                 title="Klikněte pro změnu sazby poplatku z pobytu"
               >
-                <span>{feePerNight} Kč/noc</span>
+                <span>{activeProperty?.feePerNight || feePerNight} Kč/noc</span>
                 <ChevronDown className="w-2.5 h-2.5 opacity-80" />
               </button>
             </div>
@@ -1555,12 +1576,14 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
             {activeProperty && activeDistrict && (
               <div className="flex items-center justify-between pt-0.5 text-[11px]">
                 <div className="flex items-center gap-2 min-w-0">
-                  <span className="px-2 py-0.5 rounded-md bg-blue-500/20 text-blue-300 font-bold border border-blue-500/30 truncate">
+                  <span className="px-2 py-0.5 rounded-md bg-blue-500/20 text-blue-300 font-bold border border-blue-500/30 truncate shrink-0">
                     {activeDistrict.name.replace('Městská část ', '')}
                   </span>
-                  <span className="text-slate-400 truncate">
-                    Hostitel: <strong className="text-slate-200 font-medium">{activeProperty.hostName || 'neuveden'}</strong>
-                  </span>
+                  {activeProperty.address ? (
+                    <span className="text-slate-400 truncate text-[11px]" title={activeProperty.address}>
+                      {activeProperty.address}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0 ml-2">
                   <span className="text-slate-400 font-mono">VS:</span>
@@ -2184,7 +2207,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                 </div>
 
                 <div>
-                  <label className="block font-bold text-slate-300 mb-1">Adresa v Praze</label>
+                  <label className="block font-bold text-slate-300 mb-1">Adresa</label>
                   <input
                     type="text"
                     value={propForm.address}
@@ -2220,6 +2243,25 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                     placeholder="Např. 17974305"
                     className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white font-mono outline-none focus:ring-1 focus:ring-rose-500"
                   />
+                </div>
+
+                <div>
+                  <label className="block font-bold text-slate-300 mb-1">
+                    Poplatek z pobytu za noc (Kč)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min="1"
+                      max="1000"
+                      value={propForm.feePerNight || ''}
+                      onChange={e => setPropForm(prev => ({ ...prev, feePerNight: parseInt(e.target.value) || 0 }))}
+                      placeholder={String(feePerNight)}
+                      className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white font-mono outline-none focus:ring-1 focus:ring-rose-500"
+                    />
+                    <span className="text-xs font-bold text-slate-400 shrink-0">Kč / noc</span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-1">Ukládá se do sloupce Poplatek_za_noc na listu Ubytovani. Výchozí hodnota je {feePerNight} Kč.</p>
                 </div>
 
                 <div className="pt-2 flex gap-2">
@@ -2769,7 +2811,7 @@ Zpráva: ${paymentMessage || `Airbnb ${activeProperty.name}`}`;
                   Rychlá volba sazby:
                 </label>
                 <div className="grid grid-cols-3 gap-2">
-                  {[50, 40, 30].map(amount => (
+                  {[50, 45, 40].map(amount => (
                     <button
                       key={amount}
                       type="button"

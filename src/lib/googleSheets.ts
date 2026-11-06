@@ -19,7 +19,7 @@ const DEFAULT_TITLE = 'AirTax Praha - Evidence ubytovaných';
 
 // Headers for the 4 tabs
 const HEADERS = {
-  Ubytovani: ['ID', 'Nazev_ubytovani', 'Hostitel', 'Adresa_Praha', 'Mestska_cast', 'Variabilni_symbol_ICO'],
+  Ubytovani: ['ID', 'Nazev_ubytovani', 'Hostitel', 'Adresa', 'Mestska_cast', 'Variabilni_symbol_ICO', 'Poplatek_za_noc'],
   Hoste: [
     'ID', 'Ubytovani_ID', 'Jednotka', 'Airbnb_kod', 'Prijmeni', 'Jmeno', 'Datum_narozeni',
     'Obcanstvi', 'Ucel_pobytu', 'Cislo_dokladu_pasu', 'Cislo_viza', 'Trvale_bydliste',
@@ -193,7 +193,7 @@ async function ensureRequiredSheetsExist(accessToken: string, spreadsheetId: str
  */
 async function initializeHeadersAndInitialData(accessToken: string, spreadsheetId: string) {
   const data = [
-    { range: 'Ubytovani!A1:F1', values: [HEADERS.Ubytovani] },
+    { range: 'Ubytovani!A1:G1', values: [HEADERS.Ubytovani] },
     { range: 'Hoste!A1:R1', values: [HEADERS.Hoste] },
     { range: 'Prehled_odvodu!A1:I1', values: [HEADERS.Prehled_odvodu] },
     {
@@ -263,7 +263,7 @@ export async function loadAllDataFromGoogleSheet(
 
   // Read data strictly from standard sheets
   const ranges = [
-    'Ubytovani!A2:F1000',
+    'Ubytovani!A2:G1000',
     'Hoste!A2:R5000',
     'Nastaveni!A1:C10'
   ];
@@ -304,26 +304,33 @@ export async function loadAllDataFromGoogleSheet(
     }
   }
 
-  // Parse Ubytovani
+  // Parse Ubytovani (7 columns: ID, Nazev, Hostitel, Adresa, Mestska_cast, VS, Poplatek_za_noc)
   const propRows = valueRanges[0]?.values || [];
-  const properties: Property[] = propRows.map((r: any[]) => ({
-    id: r[0] || `prop_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
-    name: r[1] || '',
-    hostName: r[2] || '',
-    address: r[3] || '',
-    districtKey: r[4] || 'praha8',
-    variableSymbol: r[5] || ''
-  })).filter((p: Property) => p.name.trim().length > 0);
+  const properties: Property[] = propRows.map((r: any[]) => {
+    const parsedPropFee = parseInt(r[6], 10);
+    return {
+      id: r[0] || `prop_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
+      name: r[1] || '',
+      hostName: r[2] || '',
+      address: r[3] || '',
+      districtKey: r[4] || 'praha8',
+      variableSymbol: r[5] || '',
+      feePerNight: !isNaN(parsedPropFee) && parsedPropFee > 0 ? parsedPropFee : feePerNight
+    };
+  }).filter((p: Property) => p.name.trim().length > 0);
 
   // Parse Hoste
   const guestRows = valueRanges[1]?.values || [];
   const guests: Guest[] = guestRows.map((r: any[]) => {
+    const propId = r[1] || '';
+    const parentProp = properties.find(p => p.id === propId);
+    const effectiveFee = parentProp?.feePerNight || feePerNight;
     const nights = Math.max(1, parseInt(r[14]) || 1);
     const exemption = (r[15] as any) || 'none';
-    const calculatedFee = exemption !== 'none' ? 0 : nights * feePerNight;
+    const calculatedFee = exemption !== 'none' ? 0 : nights * effectiveFee;
     return {
       id: r[0] || `g_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
-      propertyId: r[1] || '',
+      propertyId: propId,
       unit: r[2] || '',
       airbnbCode: r[3] || '',
       lastName: r[4] || '',
@@ -359,14 +366,15 @@ export async function syncAllToGoogleSheet(
   const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
   const currentFee = payload.feePerNight || 50;
 
-  // 1. Prepare Ubytovani rows
+  // 1. Prepare Ubytovani rows (7 columns: ID, Nazev, Hostitel, Adresa, Mestska_cast, VS, Poplatek_za_noc)
   const propRows = payload.properties.map(p => [
     p.id,
     p.name,
     p.hostName || '',
     p.address || '',
     p.districtKey || 'praha8',
-    p.variableSymbol || ''
+    p.variableSymbol || '',
+    p.feePerNight || currentFee
   ]);
 
   // 2. Prepare Hoste rows
@@ -391,13 +399,14 @@ export async function syncAllToGoogleSheet(
     g.createdAt || new Date().toISOString()
   ]);
 
-  // 3. Prepare Prehled_odvodu rows calculated per property
+  // 3. Prepare Prehled_odvodu rows calculated per property with property-specific fee
   const settlementRows = payload.properties.map(p => {
     const dist = PRAGUE_DISTRICTS[p.districtKey] || PRAGUE_DISTRICTS.praha1;
     const pGuests = payload.guests.filter(g => g.propertyId === p.id);
     const totalNights = pGuests.reduce((s, g) => s + g.nights, 0);
     const exemptNights = pGuests.reduce((s, g) => s + (g.exemption !== 'none' ? g.nights : 0), 0);
-    const fee = (totalNights - exemptNights) * currentFee;
+    const propFee = p.feePerNight || currentFee;
+    const fee = (totalNights - exemptNights) * propFee;
 
     return [
       dist.name,
@@ -417,7 +426,7 @@ export async function syncAllToGoogleSheet(
     method: 'POST',
     headers,
     body: JSON.stringify({
-      ranges: ['Ubytovani!A2:F500', 'Hoste!A2:R10000', 'Prehled_odvodu!A2:I500']
+      ranges: ['Ubytovani!A2:G500', 'Hoste!A2:R10000', 'Prehled_odvodu!A2:I500']
     })
   });
 
@@ -446,7 +455,7 @@ export async function syncAllToGoogleSheet(
   }
 
   if (propRows.length > 0) {
-    data.push({ range: `Ubytovani!A2:F${propRows.length + 1}`, values: propRows });
+    data.push({ range: `Ubytovani!A2:G${propRows.length + 1}`, values: propRows });
   }
   if (guestRows.length > 0) {
     data.push({ range: `Hoste!A2:R${guestRows.length + 1}`, values: guestRows });
